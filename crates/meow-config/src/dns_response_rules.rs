@@ -1,3 +1,4 @@
+use crate::dns_domain_matcher::build_reference;
 use crate::dns_parser::{check_domain_key, expand_policy_keys};
 use crate::raw::{RawDnsResponseAction, RawDnsResponseRule};
 use crate::rule_provider::RuleProvider;
@@ -5,7 +6,7 @@ use anyhow::{bail, Context, Result};
 use hickory_proto::rr::RecordType;
 use meow_dns::resolver::NameserverPolicyMatcher;
 use meow_dns::response_policy::{ResponseAction, ResponseRule};
-use meow_rules::{geosite::GeositeDB, RuleSet, RuleSetBehavior};
+use meow_rules::geosite::GeositeDB;
 use meow_trie::DomainTrie;
 use std::{collections::HashMap, str::FromStr, sync::Arc};
 
@@ -99,7 +100,7 @@ fn build_rule(
     let mut domain_keys: Vec<&str> = Vec::new();
     let mut match_all = false;
     for key in &keys {
-        if let Some(matcher) = build_matcher(key, geosite, providers)? {
+        if let Some(matcher) = build_reference(key, geosite, providers)? {
             matchers.push(matcher);
         } else if key == "*" {
             match_all = true;
@@ -122,43 +123,6 @@ fn build_rule(
         query_types,
         action,
     })
-}
-
-/// Compile a `geosite:`/`rule-set:` match key into a matcher of its own.
-/// Returns `None` for a plain-domain key — the caller folds all of a
-/// rule's domain keys into one shared `DomainTrie` arm.
-fn build_matcher(
-    key: &str,
-    geosite: Option<&Arc<GeositeDB>>,
-    providers: &HashMap<String, Arc<RuleProvider>>,
-) -> Result<Option<NameserverPolicyMatcher>> {
-    let lower = key.to_ascii_lowercase();
-    if let Some(category) = lower.strip_prefix("geosite:") {
-        if category.is_empty() {
-            bail!("geosite category is empty");
-        }
-        let db = Arc::clone(geosite.context("geosite condition requires a loaded database")?);
-        let category = category.to_owned();
-        return Ok(Some(Arc::new(move |host| db.lookup(&category, host))));
-    }
-    if lower.starts_with("rule-set:") {
-        let name = key["rule-set:".len()..].trim();
-        if name.is_empty() {
-            bail!("'rule-set:' key has an empty provider name");
-        }
-        let provider = providers
-            .get(name)
-            .with_context(|| format!("unknown rule-set: {name}"))?;
-        if provider.behavior == RuleSetBehavior::IpCidr {
-            bail!("rule-set '{name}' must use domain or classical behavior");
-        }
-        let provider = Arc::clone(provider);
-        return Ok(Some(Arc::new(move |host| provider.matches_domain(host))));
-    }
-    if lower.contains(':') {
-        bail!("unsupported match prefix: {key}");
-    }
-    Ok(None)
 }
 
 #[cfg(test)]

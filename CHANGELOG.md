@@ -55,6 +55,10 @@ the canonical, in-repo source a release is cut from.
 
 - `dns.fake-ip-filter` recognizes the mihomo `+.*` wildcard suffix across
   all domain depths in both blacklist and whitelist modes.
+- FakeIP filters accept `geosite:` and `rule-set:` references in blacklist and
+  whitelist modes. `fake-ip-filter-mode: rule` adds ordered domain rules with
+  `fake-ip` / `real-ip` actions; the first match wins and an unmatched name
+  defaults to fake IP. This adds no Cargo feature gate.
 
 - `dns.fake-ip-range6` installs an additional IPv6 fake-IP pool alongside the
   existing IPv4 pool. Each family preserves its mappings on unchanged reloads.

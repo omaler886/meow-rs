@@ -2,7 +2,7 @@ use crate::raw::{RawConfig, RawHosts};
 use crate::rule_provider::RuleProvider;
 use crate::DnsConfig;
 use meow_common::DnsMode;
-use meow_dns::fakeip::{FileStore, MemoryStore, Pool, Skipper, SkipperMode, Store};
+use meow_dns::fakeip::{FileStore, MemoryStore, Pool, Store};
 use meow_dns::resolver::{
     FallbackFilter, HostEntry, NameserverPolicy, NameserverPolicyMatcher, PolicyEntry,
 };
@@ -376,7 +376,9 @@ pub async fn parse_dns(
         // once for both family pools so a spelling flip can't leave v4/v6
         // disagreeing about persistence (issue #974).
         let persist = crate::resolve_profile(raw).store_fake_ip;
-        install_fakeip(&mut resolver, dns, cache_dir, prior, strict, persist).await?;
+        // Compile the filter once for the resolver, not once per family pool.
+        let skipper = crate::fakeip_filter::build(dns, geosite.as_ref(), rule_providers, strict)?;
+        install_fakeip(&mut resolver, dns, cache_dir, prior, persist).await?;
         if let Some(range) = &dns.fake_ip_range6 {
             let prefix: ipnet::Ipv6Net = range.parse().map_err(|e| {
                 anyhow::anyhow!("dns.fake-ip-range6 '{range}' is not a valid IPv6 CIDR: {e}")
@@ -389,8 +391,9 @@ pub async fn parse_dns(
             }
             let mut v6 = dns.clone();
             v6.fake_ip_range = Some(prefix.to_string());
-            install_fakeip(&mut resolver, &v6, cache_dir, prior, strict, persist).await?;
+            install_fakeip(&mut resolver, &v6, cache_dir, prior, persist).await?;
         }
+        resolver.set_fakeip_skipper(skipper);
     } else {
         // Dead-key observability for the fake-IP ranges: a user who pairs
         // them with `enhanced-mode: redir-host` (or a typo) otherwise gets a
@@ -431,7 +434,6 @@ async fn install_fakeip(
     dns: &crate::raw::RawDns,
     cache_dir: Option<&std::path::Path>,
     prior: Option<&Resolver>,
-    strict: bool,
     // The profile-resolved persistence flag — `profile.store-fake-ip`
     // already folded over `dns.store-fake-ip` by the caller (issue #974).
     persist: bool,
@@ -509,27 +511,6 @@ async fn install_fakeip(
         ipnet::IpNet::V6(_) => resolver.set_fakeip_v6(pool),
     }
 
-    // Skipper: fake-ip-filter patterns + optional fake-ip-filter-mode.
-    let patterns = dns.fake_ip_filter.clone().unwrap_or_default();
-    for p in &patterns {
-        // Dead trie keys by the same shape as `hosts:` — an empty label
-        // strands an unreachable node, and an all-dots/prefix-only body is
-        // refused by `Skipper`'s own insert (issue #822 shape). Surface
-        // both rather than let the entry sit silently dead.
-        check_domain_key("dns.fake-ip-filter", p, strict)?;
-    }
-    let skipper_mode = match dns.fake_ip_filter_mode.as_deref() {
-        Some("whitelist") | Some("white-list") => SkipperMode::WhiteList,
-        Some("blacklist") | Some("black-list") | None => SkipperMode::BlackList,
-        Some(other) => {
-            warn!(
-                "dns.fake-ip-filter-mode '{}' unknown; using 'blacklist'",
-                other
-            );
-            SkipperMode::BlackList
-        }
-    };
-    resolver.set_fakeip_skipper(Skipper::new(&patterns, skipper_mode));
     Ok(())
 }
 
@@ -723,11 +704,10 @@ fn parse_nameserver_urls(servers: &[String]) -> Result<Vec<NameServerUrl>, anyho
     parse_nameserver_entries(servers).map(|v| v.into_iter().map(|e| e.url).collect())
 }
 
-/// `true` when the raw `dns.nameserver-policy` section contains at least
-/// one `rule-set:` key (matching the case-insensitive + trimmed expansion
-/// the policy builder applies). Used by reload paths to decide
-/// whether the resolver build must load the candidate's rule-providers
-/// rather than a possibly-stale live registry (issue #514).
+/// `true` when DNS policy, response rules or an active FakeIP filter
+/// references a rule-provider (using each section's own grammar). Reload
+/// paths must build against the candidate's providers rather than a stale
+/// live registry, including when the raw YAML has not changed (issue #514).
 pub fn dns_needs_rule_providers(raw: &crate::raw::RawConfig) -> bool {
     dns_policy_keys(raw)
         .flat_map(expand_policy_keys)
@@ -735,7 +715,9 @@ pub fn dns_needs_rule_providers(raw: &crate::raw::RawConfig) -> bool {
 }
 
 /// Domain conditions that require candidate-generation provider/geosite state.
-pub(crate) fn dns_policy_keys(raw: &crate::raw::RawConfig) -> impl Iterator<Item = &str> {
+pub(crate) fn dns_policy_keys(
+    raw: &crate::raw::RawConfig,
+) -> impl Iterator<Item = std::borrow::Cow<'_, str>> {
     raw.dns.iter().flat_map(|dns| {
         dns.nameserver_policy
             .iter()
@@ -747,6 +729,8 @@ pub(crate) fn dns_policy_keys(raw: &crate::raw::RawConfig) -> impl Iterator<Item
                     .flatten()
                     .map(|rule| rule.matcher.as_str()),
             )
+            .map(std::borrow::Cow::Borrowed)
+            .chain(crate::fakeip_filter::dependency_keys(dns))
     })
 }
 
@@ -774,7 +758,7 @@ pub(crate) fn validate_node_policy_sources(raw: &RawConfig) -> anyhow::Result<()
     let Some(map) = active_node_policy(raw) else {
         return Ok(());
     };
-    for key in map.keys().flat_map(|key| expand_policy_keys(key)) {
+    for key in map.keys().flat_map(expand_policy_keys) {
         if !key.to_ascii_lowercase().starts_with("rule-set:") {
             continue;
         }
@@ -1084,8 +1068,8 @@ fn warn_if_shadowed(pattern: &str, value: &crate::raw::RawNspValue, placed: &[Pl
     }
 }
 
-pub(crate) fn expand_policy_keys(key: &str) -> Vec<String> {
-    let key = key.trim();
+pub(crate) fn expand_policy_keys(key: impl AsRef<str>) -> Vec<String> {
+    let key = key.as_ref().trim();
     let lower = key.to_ascii_lowercase();
     if lower.starts_with("geosite:") {
         return key["geosite:".len()..]

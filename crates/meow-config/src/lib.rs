@@ -4,11 +4,13 @@
 //! the tunnel, listeners, DNS, and API.
 
 pub mod auth;
+mod dns_domain_matcher;
 pub mod dns_parser;
 mod dns_proxy;
 mod dns_response_rules;
 pub mod dropped_providers;
 pub mod ech_dns;
+mod fakeip_filter;
 // Force-disabled on iOS/Android: mobile apps embed their own UI and must not
 // ship the unzip/download path regardless of the feature flag (issue #223).
 #[cfg(all(

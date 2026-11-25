@@ -10,10 +10,9 @@
 //!   semantics (per-family bucket, host↔ip bidirectional, cursor + cycle
 //!   sentinel survive restart) are identical.
 //! - `Skipper` uses our `DomainTrie` (which already supports `+.suffix`,
-//!   `*.suffix`, exact match) rather than the upstream `DomainMatcher` slice.
-//! - The full "rules-mode" skipper (`UseFakeIP` / `UseRealIP` action constants)
-//!   is not implemented — the BlackList domain-trie path is what every real
-//!   config uses. WhiteList mode is supported.
+//!   `*.suffix`, exact match) for domain filters. Provider/geosite matchers
+//!   and ordered rules arrive as closures from the configuration layer, so
+//!   DNS does not depend on the rule engine.
 //!
 //! Invariants preserved from upstream:
 //! - `.0` (network), `.1` (gateway), `.2`, `.3` reserved; first allocatable
@@ -25,6 +24,7 @@
 //! - All public `Pool` operations are mutex-serialised.
 //! - Host is lowercased before any cache or allocation work.
 
+use crate::resolver::NameserverPolicyMatcher;
 use meow_trie::DomainTrie;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -745,14 +745,27 @@ pub struct Skipper {
     mode: SkipperMode,
     /// `+.*` covers any single-label apex and all its subdomains.
     match_all: bool,
-    /// True if no patterns were configured. WhiteList with an empty trie is
-    /// a foot-gun (would bypass everything) — we treat empty WhiteList as
-    /// "skip nothing" and emit a warn at construction time.
+    /// True if no valid patterns or matchers were configured. Preserve the
+    /// old empty-WhiteList behavior: skip nothing and warn at construction.
+    /// An empty provider is still a valid matcher that can refresh later.
     empty: bool,
+    matchers: Vec<NameserverPolicyMatcher>,
+    /// First matching rule wins. `true` means real-IP, `false` fake-IP.
+    rules: Vec<(NameserverPolicyMatcher, bool)>,
 }
 
 impl Skipper {
     pub fn new(patterns: &[String], mode: SkipperMode) -> Self {
+        Self::with_matchers(patterns, mode, Vec::new())
+    }
+
+    /// Extend a domain filter with live domain matchers. A matcher counts
+    /// as a configured filter even when its provider currently has no rules.
+    pub fn with_matchers(
+        patterns: &[String],
+        mode: SkipperMode,
+        matchers: Vec<NameserverPolicyMatcher>,
+    ) -> Self {
         let mut trie: DomainTrie<()> = DomainTrie::new();
         let mut inserted = 0usize;
         let mut match_all = false;
@@ -780,7 +793,7 @@ impl Skipper {
                 warn!("fakeip: skipper ignoring unparsable pattern '{}'", raw);
             }
         }
-        let empty = inserted == 0;
+        let empty = inserted == 0 && matchers.is_empty();
         if empty && mode == SkipperMode::WhiteList {
             warn!(
                 "fakeip: fake-ip-filter-mode=whitelist with empty filter bypasses ALL hosts; \
@@ -792,17 +805,40 @@ impl Skipper {
             mode,
             match_all,
             empty,
+            matchers,
+            rules: Vec::new(),
+        }
+    }
+
+    /// Build an ordered rules filter. A `true` verdict uses the real
+    /// resolver; `false` synthesises fake-IP. No match defaults to fake-IP.
+    pub fn from_rules(rules: Vec<(NameserverPolicyMatcher, bool)>) -> Self {
+        Self {
+            trie: DomainTrie::new(),
+            mode: SkipperMode::BlackList,
+            match_all: false,
+            empty: rules.is_empty(),
+            matchers: Vec::new(),
+            rules,
         }
     }
 
     /// True if `host` should bypass fake-IP and go to a real resolver.
     pub fn should_skip(&self, host: &str) -> bool {
+        if !self.rules.is_empty() {
+            return self
+                .rules
+                .iter()
+                .find_map(|(matcher, skip)| matcher(host).then_some(*skip))
+                .unwrap_or(false);
+        }
         if self.empty {
             // Empty filter ⇒ never skip (BlackList semantics by default).
             return false;
         }
         let matched = (self.match_all && !host.trim_end_matches('.').is_empty())
-            || self.trie.search(host).is_some();
+            || self.trie.search(host).is_some()
+            || self.matchers.iter().any(|matcher| matcher(host));
         match self.mode {
             SkipperMode::BlackList => matched,
             SkipperMode::WhiteList => !matched,
@@ -1069,6 +1105,68 @@ mod tests {
             pool.look_back(first_ip).as_deref() != Some(first_host),
             "after wrap, original first_host mapping must be evicted"
         );
+    }
+
+    #[test]
+    fn skipper_live_matcher_counts_as_a_nonempty_filter() {
+        let filled = Arc::new(AtomicBool::new(false));
+        let state = Arc::clone(&filled);
+        let matcher: NameserverPolicyMatcher =
+            Arc::new(move |host| state.load(Ordering::Relaxed) && host == "live.test");
+        let black = Skipper::with_matchers(&[], SkipperMode::BlackList, vec![Arc::clone(&matcher)]);
+        let white = Skipper::with_matchers(&[], SkipperMode::WhiteList, vec![matcher]);
+        assert!(!black.should_skip("live.test"));
+        assert!(
+            white.should_skip("live.test"),
+            "empty live provider is a filter"
+        );
+        filled.store(true, Ordering::Relaxed);
+        assert!(black.should_skip("live.test"));
+        assert!(!white.should_skip("live.test"));
+        assert!(white.should_skip("other.test"));
+        assert!(!Skipper::new(&[], SkipperMode::WhiteList).should_skip("other.test"));
+    }
+
+    #[test]
+    fn skipper_matchers_preserve_domain_trie_pattern_meanings() {
+        let filter = Skipper::with_matchers(
+            &[
+                "exact.test".to_string(),
+                "+.suffix.test".to_string(),
+                "*.wild.test".to_string(),
+                ".sub.test".to_string(),
+            ],
+            SkipperMode::BlackList,
+            vec![Arc::new(|_| false)],
+        );
+        for host in [
+            "exact.test",
+            "suffix.test",
+            "a.b.suffix.test",
+            "a.wild.test",
+            "a.sub.test",
+            "a.b.sub.test",
+        ] {
+            assert!(filter.should_skip(host), "{host}");
+        }
+        for host in ["a.exact.test", "wild.test", "a.b.wild.test", "sub.test"] {
+            assert!(!filter.should_skip(host), "{host}");
+        }
+    }
+
+    #[test]
+    fn skipper_rules_stop_at_the_first_bool_verdict() {
+        let specific: NameserverPolicyMatcher = Arc::new(|host| host == "first.test");
+        let any: NameserverPolicyMatcher = Arc::new(|_| true);
+        let rules = Skipper::from_rules(vec![(specific, false), (any, true)]);
+        assert!(
+            !rules.should_skip("first.test"),
+            "fake-IP verdict must stop the scan"
+        );
+        assert!(rules.should_skip("other.test"));
+        let misses = Skipper::from_rules(vec![(Arc::new(|_| false), true)]);
+        assert!(!misses.should_skip("other.test"));
+        assert!(!Skipper::from_rules(Vec::new()).should_skip("other.test"));
     }
 
     #[test]

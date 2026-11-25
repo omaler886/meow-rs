@@ -32,8 +32,8 @@ still used internally so rules and proxies can resolve names.
 | `nameserver-policy-exclusive` | bool | `false` | Confine policy-matched queries to that entry's upstreams |
 | `fallback-filter` | block | — | When to use `fallback` |
 | `fake-ip-range` | string | `198.18.0.1/16` | Fake-IP CIDR pool |
-| `fake-ip-filter` | list | `[]` | Domains excluded/included from FakeIP |
-| `fake-ip-filter-mode` | string | `blacklist` | `blacklist` or `whitelist` |
+| `fake-ip-filter` | list | `[]` | Domain patterns/references for `blacklist`/`whitelist`, or ordered rules for `rule` |
+| `fake-ip-filter-mode` | string | `blacklist` | `blacklist`, `whitelist`, or `rule` |
 | `prefer-h3` | bool | `false` | Let every `https://` upstream prefer HTTP/3, falling back to DoH over HTTP/2 or HTTP/1.1 |
 | `store-fake-ip` | bool | `false` | Persist the fake-IP map across restarts |
 | `use-hosts` | bool | `true` | Honor the top-level `hosts:` map |
@@ -234,12 +234,130 @@ dns:
 ## FakeIP details
 
 - Fake IPs are allocated from `fake-ip-range` (default `198.18.0.0/16`) and recycled LRU.
-- `fake-ip-filter` + `fake-ip-filter-mode` decide which domains skip FakeIP (e.g. keep
-  LAN names on real DNS). `blacklist` excludes the listed patterns; `whitelist` means
-  *only* the listed patterns get fake IPs.
+- `fake-ip-filter` + `fake-ip-filter-mode` decide which domains use the normal resolver
+  instead of FakeIP. The default `blacklist` sends matching names to real DNS; `whitelist`
+  gives fake IPs only to matching names.
 - `store-fake-ip: true` persists allocations (`fakeip-v4.json` / `fakeip-v6.json`) so the
   same domain keeps its fake IP across restarts.
 - Flush at runtime with `POST /cache/fakeip/flush`.
+
+### `blacklist` and `whitelist` lists
+
+In these modes, entries are combined as a set: a hit on any entry is a match, and list
+order does not select a verdict. Entries can be ordinary domain patterns, `geosite:`
+categories, or `rule-set:` providers. Ordinary patterns keep the existing trie semantics:
+`example.test` is exact, `+.example.test` includes the apex and every subdomain, `*.example.test`
+means exactly one label, and `.example.test` means subdomains at any depth except the apex.
+The special `+.*` matches every nonempty hostname. A prefixed selector can expand a comma-
+separated list, for example `geosite:cn,private` or `rule-set:lan,corp`.
+
+```yaml
+rule-providers:
+  lan-domains:
+    type: inline
+    behavior: domain
+    payload:
+      - "+.internal.example"
+
+dns:
+  enable: true
+  enhanced-mode: fake-ip
+  nameserver: [1.1.1.1]
+  fake-ip-filter-mode: blacklist
+  fake-ip-filter:
+    - "geosite:cn"
+    - "rule-set:lan-domains"
+```
+
+With `blacklist`, names in either selector use normal DNS and all other names receive fake
+IPs. This complete alternative uses the same selectors as a whitelist:
+
+```yaml
+rule-providers:
+  lan-domains:
+    type: inline
+    behavior: domain
+    payload:
+      - "+.internal.example"
+
+dns:
+  enable: true
+  enhanced-mode: fake-ip
+  nameserver: [1.1.1.1]
+  fake-ip-filter-mode: whitelist
+  fake-ip-filter:
+    - "geosite:cn"
+    - "rule-set:lan-domains"
+```
+
+A `rule-set:` provider must be present and use `domain` or `classical` behavior; `ipcidr`
+providers are rejected. Provider names are case-sensitive. A classical provider is queried
+through meow's existing `matches_domain` path using the DNS hostname only, without IP
+resolution; this is the host-only query contract, not a claim that Mihomo rejects non-domain
+entries from classical providers. A `geosite:` selector requires a loaded geosite database;
+an absent category simply has no matches. Missing providers, unsupported provider behavior,
+and unavailable geosite data are configuration errors. A provider that is configured but
+currently has no entries still counts as a matcher: it matches nothing until data is loaded
+or refreshed. An actually empty `fake-ip-filter` keeps meow's legacy behavior and skips
+nothing, so both list modes allocate fake IPs for all names; an empty whitelist also warns.
+
+### Ordered `rule` filters
+
+Set `fake-ip-filter-mode: rule` to use an ordered list of `TYPE,payload,action` rules. The
+first matching rule wins. `fake-ip` allocates from the queried family's pool; `real-ip` uses
+the normal resolver path. If no rule matches, the default is `fake-ip`. `MATCH,action` is an
+optional explicit catch-all.
+
+```yaml
+rule-providers:
+  lan-domains:
+    type: inline
+    behavior: domain
+    payload:
+      - "+.internal.example"
+
+dns:
+  enable: true
+  enhanced-mode: fake-ip
+  nameserver: [1.1.1.1]
+  fake-ip-filter-mode: rule
+  fake-ip-filter:
+    - "DOMAIN,overlap.internal.example,fake-ip"
+    - "RULE-SET,lan-domains,real-ip"
+    - "GEOSITE,cn,real-ip"
+```
+
+The exact-host rule above wins before the overlapping `RULE-SET` rule. Replace `cn` with a
+category in the loaded geosite database. If all names outside the listed cases should use
+real IPs, append `MATCH,real-ip`.
+
+Rule types are `DOMAIN`, `DOMAIN-SUFFIX`, `DOMAIN-KEYWORD`, `DOMAIN-REGEX`,
+`DOMAIN-WILDCARD`, `GEOSITE`, `RULE-SET`, and `MATCH`. A non-`MATCH` line has exactly one
+payload and one action. Regex and wildcard payloads may contain commas; regex matching is
+case-sensitive, while wildcard `*` matches one nonempty label and is case-insensitive.
+Actions accept `fake-ip` or `real-ip` (ASCII case-insensitive, surrounding whitespace
+ignored); rule type names are normalized to uppercase. Extra flags are not accepted. Invalid
+types/actions, empty or malformed rule syntax, invalid regexes, missing providers, `ipcidr`
+providers, and unavailable geosite data fail configuration loading. Dead label shapes in
+typed domain payloads warn and remain active in lenient mode; `strict: true` turns those
+warnings into errors. This checks label shape, not the routing engine's narrower
+`is_valid_host` alphabet, so numeric exact names and a literal `?` are not rejected by this
+gate. An unknown filter mode retains the existing warning and falls back to `blacklist`.
+
+### Provider refresh and reload
+
+DNS matchers hold the live rule-provider object. A configured HTTP `interval` refresh or
+`PUT /providers/rules/{name}` refresh takes effect on later DNS queries without rebuilding
+the resolver; a manual refresh re-reads a file provider, while inline data changes with a
+config rebuild. `PUT /configs` rebuilds the candidate DNS resolver and commits it with the
+candidate config; if validation rejects the candidate, the running resolver and filters stay
+active.
+
+`meow -t` performs offline validation. It uses an HTTP provider's on-disk cache when present
+and does not fetch an uncached HTTP provider; that provider is registered empty so references
+and provider behavior can still be checked, but its data matches nothing until a refresh
+succeeds. File providers are read locally, inline providers use their configured payload, and
+`geosite:` still requires the relevant database to be available.
 
 ## Proxy server hostnames
 

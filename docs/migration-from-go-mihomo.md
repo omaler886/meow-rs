@@ -1,6 +1,6 @@
 # Migration guide: Go mihomo → meow-rs
 
-Last updated: 2026-06-19. Tracks the current default app feature set.
+Last updated: 2026-11-26. Tracks the current default app feature set.
 Owner: pm. Tracks roadmap item: **M1.H-3**.
 Review cadence: updated at each milestone exit.
 
@@ -101,7 +101,7 @@ cause problems; items marked ~ work with caveats; items marked ✓ work.
 | `dns:` — `nameserver-policy-exclusive` | ✓ | meow-rs opt-in for upstream's ordering: a policy match is terminal — no `fallback-filter` domain/IP gate, no main/`fallback:` tiers. Off by default (meow's default tiers defer to `fallback-filter`). |
 | `dns:` — `fallback-filter` | ✓ | GeoIP/IP-CIDR/domain gates. |
 | `hosts:` (top level) + `dns:` `use-system-hosts` | ✓ | M1.E-5, wildcards supported. |
-| `dns:` — `fake-ip` mode | ✓ | v4/v6 pools, `fake-ip-filter`, `fake-ip-filter-mode`, `store-fake-ip` JSON persistence. See §fake-ip mode. |
+| `dns:` — `fake-ip` mode | ✓ | v4/v6 pools; blacklist/whitelist patterns with `geosite:` and `rule-set:` references; ordered domain rules with `fake-ip`/`real-ip` actions in `rule` mode; `store-fake-ip` JSON persistence. See §fake-ip mode. |
 | `tproxy-port` | ✓ | Linux nftables / macOS pf. Managed-REDIRECT semantic (TCP, host `output` chain) — mihomo's real-TPROXY shorthand maps to `listeners:` `type: tproxy transparent: true` instead. |
 | `redir-port` | ✓ | Deployer-REDIRECT listener, meow owns no rules. Same as `listeners:` `type: redir`. |
 | `routing-mark` | ✓ | Linux only. `SO_MARK` on every outbound socket; the deployer's rules exempt meow's own traffic. |
@@ -608,27 +608,166 @@ synthetic IP from the configured CIDR. The tunnel rewrites incoming
 connections back to the hostname before rule matching, mirroring upstream
 `tunnel/tunnel.go::preHandleMetadata`.
 
+#### `blacklist` and `whitelist`
+
+These modes treat `fake-ip-filter` as an unordered set: any matching entry
+matches the filter. Each entry can be a domain pattern, a `geosite:` category,
+or a `rule-set:` provider. Prefixed selectors support comma-separated values.
+A domain provider makes a standalone example:
+
 ```yaml
+rule-providers:
+  lan-domains:
+    type: inline
+    behavior: domain
+    payload:
+      - "+.internal.example"
+
 dns:
   enable: true
   enhanced-mode: fake-ip
-  fake-ip-range: "198.18.0.1/16"      # default if omitted
+  fake-ip-range: "198.18.0.1/16"
+  nameserver: [1.1.1.1]
+  fake-ip-filter-mode: blacklist
   fake-ip-filter:
-    - "+.local"
-    - "+.lan"
-    - "example.corp"                  # plain entry = exact match only
-  fake-ip-filter-mode: blacklist      # default; whitelist also accepted
-  store-fake-ip: true                 # optional: persist mappings across restart
+    - "geosite:cn"
+    - "rule-set:lan-domains"
+  store-fake-ip: true
 ```
 
+With `blacklist`, names matching either selector use the normal resolver and
+all others get fake IPs. This complete alternative uses the same selectors as
+a whitelist:
+
+```yaml
+rule-providers:
+  lan-domains:
+    type: inline
+    behavior: domain
+    payload:
+      - "+.internal.example"
+
+dns:
+  enable: true
+  enhanced-mode: fake-ip
+  fake-ip-range: "198.18.0.1/16"
+  nameserver: [1.1.1.1]
+  fake-ip-filter-mode: whitelist
+  fake-ip-filter:
+    - "geosite:cn"
+    - "rule-set:lan-domains"
+```
+
+A whitelist match gets a fake IP; a nonmatch uses the normal resolver. Ordinary
+patterns keep their existing trie semantics: `example.com` is exact,
+`+.example.com` includes the apex and all subdomains, `*.example.com` matches
+exactly one label, and `.example.com` matches any-depth subdomains except the
+apex. `+.*` matches every nonempty hostname. A truly empty filter retains
+meow-rs's legacy behavior and skips nothing, so both list modes allocate fake
+IPs for all names; an empty whitelist also warns. A referenced provider with
+no current entries is still a configured matcher: in whitelist mode its misses
+use the normal resolver until provider data arrives.
+
+`rule-set:` provider names are case-sensitive. Providers must use `domain` or
+`classical` behavior; `ipcidr` and missing providers are configuration errors.
+`geosite:` requires a loaded geosite database; a missing database is an error.
+An absent category has no matches. In meow-rs, provider matching uses the
+existing `matches_domain` query contract: it receives the DNS hostname only
+and does not resolve an IP. A classical provider is evaluated against that
+host-only metadata, not rewritten into a different provider behavior.
+
+#### Ordered `rule` mode
+
+Set `fake-ip-filter-mode: rule` for ordered `TYPE,payload,action` lines. The
+first match decides the result: `fake-ip` allocates from the queried family's
+pool and `real-ip` uses the normal resolver path. An unmatched name defaults
+to fake IP. `MATCH,action` is an optional catch-all.
+
+```yaml
+rule-providers:
+  lan-domains:
+    type: inline
+    behavior: domain
+    payload:
+      - "+.internal.example"
+
+dns:
+  enable: true
+  enhanced-mode: fake-ip
+  nameserver: [1.1.1.1]
+  fake-ip-filter-mode: rule
+  fake-ip-filter:
+    - "DOMAIN,overlap.internal.example,fake-ip"
+    - "RULE-SET,lan-domains,real-ip"
+    - "GEOSITE,cn,real-ip"
+```
+
+The exact-host entry wins before the overlapping provider entry. Replace `cn`
+with a category available in the loaded geosite database. Append
+`MATCH,real-ip` if every unmatched name should instead use real IPs.
+
+Supported types are `DOMAIN`, `DOMAIN-SUFFIX`, `DOMAIN-KEYWORD`,
+`DOMAIN-REGEX`, `DOMAIN-WILDCARD`, `GEOSITE`, `RULE-SET`, and `MATCH`.
+`MATCH` takes only an action; other types take one payload and one action.
+Type names are normalized to uppercase and `fake-ip` / `real-ip` actions are
+trimmed and ASCII case-insensitive. Regex and wildcard payloads preserve
+commas; regex matching is case-sensitive, while wildcard `*` matches one
+nonempty label case-insensitively. Rule flags/extra parameters are not a
+separate supported field. Invalid rule types/actions, empty or malformed rule
+syntax, invalid regexes, missing providers, `ipcidr` providers, and missing
+geosite databases fail configuration loading. Dead label shapes in typed
+domain payloads warn and remain active in lenient mode; `strict: true` turns
+them into errors. This checks label shape rather than routing's narrower
+`is_valid_host` alphabet, so numeric exact names and a literal `?` are not
+rejected by this check. An unknown mode keeps the existing warning and
+blacklist fallback.
+
+For a `classical` provider, `matches_domain` is meow-rs's domain-query
+contract: it supplies the query hostname and does not perform IP resolution.
+The current classical implementation evaluates rules against host-only
+metadata; it is not a schema-level filter that removes every non-domain rule.
+Mihomo's FakeIP path likewise constructs `Metadata{Host: domain}` and invokes
+the classical provider matcher. Consequently, some non-domain predicates can
+match if a zero-valued metadata field satisfies them; this is not an upstream
+restriction that classical providers contain domain rules only. See Mihomo's
+[config parser](https://github.com/MetaCubeX/mihomo/blob/Meta/config/config.go)
+and [FakeIP skipper](https://github.com/MetaCubeX/mihomo/blob/Meta/component/fakeip/skipper.go).
+
+#### Offline validation, refresh, and release acceptance
+
+`meow -t` validates offline. It uses an HTTP provider's disk cache when
+available and does not fetch an uncached HTTP provider. The provider is still
+registered empty so references and provider behavior are checked, but its data
+cannot match until a refresh succeeds. File providers are read from disk;
+inline providers use their configured payload. A missing provider reference,
+`ipcidr` provider, malformed rule, or missing geosite database remains an
+error. Passing `-t` without an HTTP cache validates configuration structure,
+not the contents or runtime matches of that remote feed.
+
+DNS filters hold live provider references. A configured HTTP `interval`
+refresh and `PUT /providers/rules/{name}` make new provider data visible to
+subsequent DNS queries without rebuilding the resolver; manual refresh also
+re-reads a file provider. Inline provider data changes on config rebuild.
+`PUT /configs` rebuilds the candidate resolver and commits it with the
+candidate config; a rejected candidate leaves the running resolver and rules
+active.
+
+Release acceptance should cover: blacklist hit -> real IP and miss -> fake IP;
+whitelist hit -> fake IP and miss -> real IP; overlapping `rule` entries where
+the first verdict wins; unmatched `rule` -> fake IP; and an explicit
+`MATCH,real-ip`. Also check invalid/missing provider references, `ipcidr`,
+invalid actions/types/regexes, lenient dead-label warnings versus strict
+rejection, offline HTTP validation with and without cache, a live provider
+refresh, and a successful/rejected config rebuild. These are verification
+recommendations, not reported test results.
+
+No Cargo feature flag is required, including for `minimal` builds. Stable and
+alpha release artifacts both use `release` with `full`; `MEOW_VERSION_SUFFIX`
+(`""` or `"-alpha+sha7"`) only changes the version string emitted by `build.rs`.
+
 - **Pool layout.** Network/.1 (gateway)/.2/.3/broadcast are reserved; first
-  allocatable is `network + 4`. Effective capacity = `prefix_size − 4`.
+  allocatable is `network + 4`. Effective capacity = `prefix_size - 4`.
   Sequential cursor, wraps on exhaustion and evicts the oldest mapping.
-- **Filter.** `BlackList` (default) routes matched hosts through the real
-  resolver; `WhiteList` does the opposite. Plain entries are exact matches
-  (`example.com` matches only `example.com` — same as upstream DomainSet
-  semantics); use `+.example.com` for apex + any-depth subdomains, `*.` for
-  exactly one label, `.` for any-depth subdomains excluding the apex.
 - **AAAA in v4-only configs.** Returns NOERROR-empty so clients fall back
   to IPv4 cleanly. To allocate v6 fake IPs alongside the v4 pool, set
   `fake-ip-range6` (e.g. `fdfe:dcba:9876::/64`) — an IPv6 CIDR in
