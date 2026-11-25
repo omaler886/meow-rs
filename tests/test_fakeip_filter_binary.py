@@ -186,6 +186,7 @@ def main():
     parser.add_argument('--flavor', choices=('stable', 'alpha'), required=True)
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
+    args.output = args.output.resolve()
     binary = args.binary.resolve()
     source_root = Path(__file__).resolve().parents[1]
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -209,6 +210,10 @@ def main():
             'cargo build --locked --release -p meow-app --bin meow'),
         'version_suffix': os.environ.get('MEOW_VERSION_SUFFIX', ''),
     }
+    if source['tracked_worktree_dirty']:
+        raise RuntimeError('refusing to bind a binary test to a dirty source tree')
+    source['build_target'] = os.environ.get('CARGO_BUILD_TARGET') or next(
+        line.split(': ', 1)[1] for line in source['rustc'].splitlines() if line.startswith('host: '))
     version = subprocess.check_output([str(binary), '-v'], text=True).strip()
     base = tomllib.loads((source_root / 'Cargo.toml').read_text())['workspace']['package']['version']
     suffix = '-alpha+' + source['commit'][:7] if args.flavor == 'alpha' else ''
