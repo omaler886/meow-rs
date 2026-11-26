@@ -295,7 +295,10 @@ providers are rejected. Provider names are case-sensitive. A classical provider 
 through meow's existing `matches_domain` path using the DNS hostname only, without IP
 resolution; this is the host-only query contract, not a claim that Mihomo rejects non-domain
 entries from classical providers. A `geosite:` selector requires a loaded geosite database;
-an absent category simply has no matches. Missing providers, unsupported provider behavior,
+an absent category simply has no matches. GEOSITE database matching folds ASCII query case,
+including plain/regex database entries; explicit `DOMAIN-REGEX` rules keep their case-sensitive
+semantics. Entirely empty prefixed lists such as `geosite:,,` are configuration errors.
+Missing providers, unsupported provider behavior,
 and unavailable geosite data are configuration errors. A provider that is configured but
 currently has no entries still counts as a matcher: it matches nothing until data is loaded
 or refreshed. An actually empty `fake-ip-filter` keeps meow's legacy behavior and skips

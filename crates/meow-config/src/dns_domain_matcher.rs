@@ -21,8 +21,13 @@ pub(crate) fn build_reference(
             bail!("geosite category is empty");
         }
         let db = Arc::clone(geosite.context("geosite condition requires a loaded database")?);
-        let category = category.to_owned();
-        return Ok(Some(Arc::new(move |host| db.lookup(&category, host))));
+        // Resolve immutable category/attribute keys once. Query case folding
+        // lives in GeositeDB, shared with classical RULE-SET providers.
+        let keys = db.resolve_keys(category);
+        return Ok(Some(Arc::new(move |host| {
+            keys.as_ref()
+                .is_some_and(|keys| keys.iter().all(|key| db.lookup_resolved(key, host)))
+        })));
     }
     if lower.starts_with("rule-set:") {
         let name = key["rule-set:".len()..].trim();
@@ -42,4 +47,47 @@ pub(crate) fn build_reference(
         bail!("unsupported match prefix: {key}");
     }
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn field(number: u8, value: &[u8]) -> Vec<u8> {
+        assert!(value.len() < 128);
+        let mut bytes = vec![(number << 3) | 2, value.len() as u8];
+        bytes.extend_from_slice(value);
+        bytes
+    }
+
+    #[test]
+    fn geosite_dns_matchers_fold_ascii_and_resolve_attribute_keys() {
+        let mut entry = field(1, b"fixture");
+        for (kind, value) in [
+            (0, b"needle".as_slice()),
+            (1, b"^rx[0-9]+[.]test$".as_slice()),
+        ] {
+            let mut domain = vec![8, kind];
+            domain.extend(field(2, value));
+            domain.extend(field(3, &field(1, b"ads")));
+            entry.extend(field(2, &domain));
+        }
+        let db = Arc::new(GeositeDB::from_bytes(&field(1, &entry), None).unwrap());
+        for category in ["fixture", "fixture@ads"] {
+            let matcher =
+                build_reference(&format!("geosite:{category}"), Some(&db), &HashMap::new())
+                    .unwrap()
+                    .unwrap();
+            for host in ["xneedle.test", "XNEEDLE.TEST", "rx12.test", "RX12.TEST"] {
+                assert!(matcher(host), "{category}: {host}");
+            }
+            assert!(!matcher("outside.test"));
+            let oversized = format!("{}NEEDLE.test", "A".repeat(300));
+            assert!(matcher(&oversized));
+        }
+        let absent = build_reference("geosite:missing", Some(&db), &HashMap::new())
+            .unwrap()
+            .unwrap();
+        assert!(!absent("XNEEDLE.TEST"));
+    }
 }

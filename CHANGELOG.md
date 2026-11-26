@@ -8,6 +8,19 @@ the canonical, in-repo source a release is cut from.
 
 ## [Unreleased]
 
+### Fixed
+
+- FakeIP `geosite:` and typed `GEOSITE` DNS filters now fold ASCII query
+  case before matching plain/regex database entries, including GEOSITE inside
+  classical RULE-SET providers. Category/attribute keys
+  are resolved at configuration time; ordinary DNS names use a stack buffer
+  so mixed-case queries do not add a per-query heap allocation. Explicit
+  `DOMAIN-REGEX` rules retain their case-sensitive semantics.
+- Revalidate DNS when only top-level `strict` changes during a config reload;
+  a previously lenient dead filter no longer bypasses strict admission.
+- Reject entirely empty prefixed FakeIP lists such as `geosite:,,` instead
+  of silently selecting the legacy empty-whitelist behavior.
+
 ### Added
 
 - `global-client-fingerprint` and `global-ua` — mihomo's two top-level

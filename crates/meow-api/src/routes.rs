@@ -2974,6 +2974,9 @@ fn dns_inputs_equal(a: &RawConfig, b: &RawConfig) -> bool {
     let base = hosts_equal
         && nsp_equal
         && dns_sections_equal
+        // Strictness changes DNS admission even when its raw section is equal.
+        // Re-run validation instead of retaining a leniently accepted filter.
+        && a.strict.unwrap_or(false) == b.strict.unwrap_or(false)
         && a.ipv6 == b.ipv6
         && a.geodata == b.geodata
         && a.geox_url == b.geox_url;
@@ -7112,10 +7115,23 @@ mod tests {
         );
     }
 
-    /// `geox-url` feeds `parse_geodata`, which feeds the DNS build — two
-    /// raws that differ ONLY in `geox-url` must compare unequal, otherwise a
-    /// `PUT /configs` that touches just the alias would be judged unchanged
-    /// and skip the resolver-side geodata reparse.
+    /// A strictness-only reload must revalidate leniently accepted DNS keys.
+    #[test]
+    fn dns_inputs_equal_counts_effective_strictness() {
+        let raw: RawConfig = serde_saphyr::from_str(
+            "dns: {enable: true, enhanced-mode: fake-ip, fake-ip-filter-mode: rule, fake-ip-filter: ['DOMAIN,a..b,real-ip']}"
+        ).unwrap();
+        let mut lenient = raw.clone();
+        lenient.strict = Some(false);
+        assert!(dns_inputs_equal(&raw, &lenient));
+        let mut strict = raw.clone();
+        strict.strict = Some(true);
+        assert!(!dns_inputs_equal(&raw, &strict));
+        assert!(!dns_inputs_equal(&strict, &raw));
+        assert!(dns_inputs_equal(&strict, &strict));
+    }
+
+    /// `geox-url` feeds the same DNS geodata build as `geodata.url.*`.
     #[test]
     fn dns_inputs_equal_counts_geox_url() {
         let raw_a: RawConfig =

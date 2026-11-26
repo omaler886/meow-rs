@@ -639,3 +639,78 @@ async fn offline_validation_does_not_fetch_a_referenced_http_provider() {
         "offline validation attempted an HTTP provider fetch"
     );
 }
+
+#[tokio::test]
+async fn geosite_plain_filters_are_ascii_case_insensitive_on_dns_wire() {
+    fn field(number: u8, value: &[u8]) -> Vec<u8> {
+        assert!(value.len() < 128);
+        let mut bytes = vec![(number << 3) | 2, value.len() as u8];
+        bytes.extend_from_slice(value);
+        bytes
+    }
+    let mut domain = vec![8, 0];
+    domain.extend(field(2, b"needle"));
+    let mut entry = field(1, b"fixture");
+    entry.extend(field(2, &domain));
+    let db = Arc::new(GeositeDB::from_bytes(&field(1, &entry), None).unwrap());
+    let upstream = Upstream::start().await;
+    let raw = parse_raw_yaml(
+        "rule-providers: {geo: {type: inline, behavior: classical, payload: ['GEOSITE,fixture']}}",
+    )
+    .unwrap();
+    let context = meow_rules::parser::ParserContext {
+        geosite: Some(Arc::clone(&db)),
+        ..Default::default()
+    };
+    let providers = meow_config::rule_provider::load_providers(
+        raw.rule_providers.as_ref().unwrap(),
+        None,
+        &context,
+        None,
+        true,
+    )
+    .unwrap();
+    for mode in ["blacklist", "whitelist", "rule"] {
+        let filters = if mode == "rule" {
+            "['GEOSITE,fixture,real-ip', 'MATCH,fake-ip']"
+        } else {
+            "['geosite:fixture']"
+        };
+        for classical in [false, true] {
+            let selected = if classical {
+                if mode == "rule" {
+                    "['RULE-SET,geo,real-ip', 'MATCH,fake-ip']"
+                } else {
+                    "['rule-set:geo']"
+                }
+            } else {
+                filters
+            };
+            let config = configuration(
+            upstream.address,
+            &format!("enhanced-mode: fake-ip\nfake-ip-range6: 'fd00::/112'\nfake-ip-filter-mode: {mode}\nfake-ip-filter: {selected}"),
+            &providers,
+            Some(Arc::clone(&db)),
+            None,
+            "",
+        )
+        .await
+        .unwrap();
+            for host in ["xneedle.test", "XNEEDLE.TEST"] {
+                for kind in [RecordType::A, RecordType::AAAA] {
+                    let response = answer(&config.resolver, host, kind).await;
+                    if mode == "whitelist" {
+                        assert_fake(&config.resolver, &response);
+                    } else {
+                        let expected = if kind == RecordType::A {
+                            "192.0.2.9"
+                        } else {
+                            "2001:db8::9"
+                        };
+                        assert_real(&response, expected.parse().unwrap());
+                    }
+                }
+            }
+        }
+    }
+}

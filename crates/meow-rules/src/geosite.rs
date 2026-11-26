@@ -72,14 +72,16 @@ impl GeositeDB {
     /// True iff `domain` is in the named category. Category match is
     /// case-insensitive. Unknown categories return `false` (no error).
     pub fn lookup(&self, category: &str, domain: &str) -> bool {
-        let (base, attrs) = split_category_attrs(category);
-        if !attrs.is_empty() {
-            return attrs.iter().all(|attr| {
-                let attr_category = format!("{base}@{attr}");
-                self.lookup_one(&attr_category, domain)
-            });
-        }
-        self.lookup_one(base, domain)
+        with_ascii_lowercase(domain, |domain| {
+            let (base, attrs) = split_category_attrs(category);
+            if !attrs.is_empty() {
+                return attrs.iter().all(|attr| {
+                    let attr_category = format!("{base}@{attr}");
+                    self.lookup_one(&attr_category, domain)
+                });
+            }
+            self.lookup_one(base, domain)
+        })
     }
 
     fn lookup_one(&self, category: &str, domain: &str) -> bool {
@@ -134,8 +136,8 @@ impl GeositeDB {
     /// the DB is immutable after startup, such a rule can never match and
     /// callers may prune it. The returned keys are pre-case-folded and
     /// pre-formatted so per-connection matching via
-    /// [`Self::lookup_resolved`] does no splitting, case work, or
-    /// allocation.
+    /// [`Self::lookup_resolved`] avoids category splitting and case scans.
+    /// Query ASCII case folding uses stack storage for ordinary DNS names.
     pub fn resolve_keys(&self, category: &str) -> Option<Vec<String>> {
         let (base, attrs) = split_category_attrs(category);
         if base.is_empty() {
@@ -159,22 +161,7 @@ impl GeositeDB {
     /// [`Self::resolve_keys`]. Skips the per-lookup attribute splitting and
     /// case-fold scan that [`Self::lookup`] pays.
     pub fn lookup_resolved(&self, key: &str, domain: &str) -> bool {
-        if let Some(trie) = self.categories.get(key) {
-            if trie.search(domain).is_some() {
-                return true;
-            }
-        }
-        if let Some(kws) = self.keywords.get(key) {
-            if kws.iter().any(|kw| domain.contains(kw.as_str())) {
-                return true;
-            }
-        }
-        if let Some(compiled) = self.regex_compiled.get(key) {
-            if compiled.iter().any(|re| re.is_match(domain)) {
-                return true;
-            }
-        }
-        false
+        with_ascii_lowercase(domain, |domain| self.lookup_one(key, domain))
     }
 
     /// Number of categories in the DB.
@@ -304,6 +291,24 @@ impl GeositeDB {
         let bytes = std::fs::read(path)?;
         Self::from_bytes(&bytes, allowed)
     }
+}
+
+// Geosite database entries use canonical ASCII case, including plain/regex
+// entries. Normalize here so direct DNS filters, classical providers and the
+// compiled rule engine share the same verdict. Valid DNS names stay on stack;
+// oversized internal callers retain their full key via the slow path.
+fn with_ascii_lowercase(domain: &str, matches: impl FnOnce(&str) -> bool) -> bool {
+    if !domain.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        return matches(domain);
+    }
+    let mut folded = [0u8; 256];
+    if domain.len() > folded.len() {
+        return matches(&domain.to_ascii_lowercase());
+    }
+    let bytes = &mut folded[..domain.len()];
+    bytes.copy_from_slice(domain.as_bytes());
+    bytes.make_ascii_lowercase();
+    matches(std::str::from_utf8(bytes).expect("ASCII folding preserves UTF-8"))
 }
 
 fn split_category_attrs(category: &str) -> (&str, Vec<String>) {
@@ -602,5 +607,52 @@ mod tests {
         let candidates = vec![path];
         let result = discover_and_load_from(&candidates, None);
         assert!(result.is_none());
+    }
+}
+
+#[cfg(test)]
+mod ascii_case_tests {
+    use super::*;
+
+    fn field(number: u8, value: &[u8]) -> Vec<u8> {
+        assert!(value.len() < 128);
+        let mut bytes = vec![(number << 3) | 2, value.len() as u8];
+        bytes.extend_from_slice(value);
+        bytes
+    }
+
+    #[test]
+    fn both_lookup_paths_fold_plain_regex_and_attribute_queries() {
+        let mut entry = field(1, b"fixture");
+        for (kind, value) in [
+            (0, b"needle".as_slice()),
+            (1, b"^rx[0-9]+[.]test$".as_slice()),
+        ] {
+            let mut domain = vec![8, kind];
+            domain.extend(field(2, value));
+            domain.extend(field(3, &field(1, b"ads")));
+            entry.extend(field(2, &domain));
+        }
+        let db = GeositeDB::from_bytes(&field(1, &entry), None).unwrap();
+        for category in ["fixture", "fixture@ads"] {
+            let keys = db.resolve_keys(category).unwrap();
+            for host in [
+                "xneedle.test",
+                "XNEEDLE.TEST",
+                "rx12.test",
+                "RX12.TEST",
+                "É.NEEDLE.test",
+            ] {
+                assert!(db.lookup(category, host), "{category}: {host}");
+                assert!(keys.iter().all(|key| db.lookup_resolved(key, host)));
+            }
+            assert!(!db.lookup(category, "outside.test"));
+            for len in [256, 257, 320] {
+                let host = format!("{}NEEDLE.test", "A".repeat(len - "NEEDLE.test".len()));
+                assert!(db.lookup(category, &host));
+                assert!(keys.iter().all(|key| db.lookup_resolved(key, &host)));
+            }
+        }
+        assert!(!db.lookup("missing", "XNEEDLE.TEST"));
     }
 }

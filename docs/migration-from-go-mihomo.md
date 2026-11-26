@@ -765,6 +765,11 @@ No Cargo feature flag is required, including for `minimal` builds. Stable and
 alpha release artifacts both use `release` with `full`; `MEOW_VERSION_SUFFIX`
 (`""` or `"-alpha+sha7"`) only changes the version string emitted by `build.rs`.
 
+The branch's Ubuntu 24.04 GNU binaries require glibc 2.39 or newer. They
+are not portable to Debian 12's glibc 2.36: build from source on that older
+baseline (with the pinned Rust toolchain), or run them in a compatible
+container. This does not describe the separately built musl release targets.
+
 - **Pool layout.** Network/.1 (gateway)/.2/.3/broadcast are reserved; first
   allocatable is `network + 4`. Effective capacity = `prefix_size - 4`.
   Sequential cursor, wraps on exhaustion and evicts the oldest mapping.

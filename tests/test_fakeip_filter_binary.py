@@ -231,7 +231,7 @@ def main():
             root = Path(temporary)
 
             @contextlib.contextmanager
-            def run_case(mode, filters, geosite=False, provider_payload=None):
+            def run_case(mode, filters, geosite=False, provider_payload=None, geosite_kind=2, classical_geosite=False):
                 case = root / (str(len(checks)) + '-' + mode)
                 case.mkdir()
                 (case / 'provider.yaml').write_text("payload:\n  - '+.real.test'\n  - priority.test\n")
@@ -240,13 +240,18 @@ def main():
                 dns_port = free_port(socket.SOCK_DGRAM)
                 api_port = free_port(socket.SOCK_STREAM)
                 text = configuration(case, upstream, dns_port, api_port, mode, filters)
+                if classical_geosite:
+                    (case / 'provider.yaml').write_text("payload: ['GEOSITE,fixture']\n")
+                    text = text.replace('behavior: domain', 'behavior: classical').replace(
+                        "rules: ['MATCH,DIRECT']", "rules: ['GEOSITE,fixture,DIRECT', 'MATCH,DIRECT']")
                 if geosite:
                     # Minimal V2Ray GeoSiteList with a suffix domain, loaded
                     # through the real config discovery path (not DB injection).
                     def field(number, value):
                         assert len(value) < 128
                         return bytes([(number << 3) | 2, len(value)]) + value
-                    domain = b'\x08\x02' + field(2, b'geo.test')
+                    value = b'needle' if geosite_kind == 0 else b'geo.test'
+                    domain = bytes([8, geosite_kind]) + field(2, value)
                     entry = field(1, b'fixture') + field(2, domain)
                     geofile = case / 'geosite.dat'
                     geofile.write_bytes(field(1, entry))
@@ -334,6 +339,20 @@ def main():
                         assert fields[4] == socket.inet_pton(socket.AF_INET, REAL4), (name, kind, fields)
                         assert fields[6] == socket.inet_pton(socket.AF_INET6, REAL6), (name, kind, fields)
                     passed(f'{label}-rr{kind}')
+
+            for mode in ('blacklist', 'whitelist', 'rule'):
+                filters = (['GEOSITE,fixture,real-ip', 'MATCH,fake-ip'] if mode == 'rule'
+                           else ['geosite:fixture'])
+                with run_case(mode, filters, geosite=True, geosite_kind=0) as (_, port, _, _):
+                    expect_ip(port, 'xneedle.test', mode == 'whitelist', mode + '-geosite-plain-lower')
+                    expect_ip(port, 'XNEEDLE.TEST', mode == 'whitelist', mode + '-geosite-plain-upper')
+
+            for mode in ('blacklist', 'whitelist', 'rule'):
+                filters = (['RULE-SET,realset,real-ip', 'MATCH,fake-ip'] if mode == 'rule'
+                           else ['rule-set:realset'])
+                with run_case(mode, filters, geosite=True, geosite_kind=0, classical_geosite=True) as (_, port, _, _):
+                    expect_ip(port, 'xneedle.test', mode == 'whitelist', mode + '-classical-geosite-lower')
+                    expect_ip(port, 'XNEEDLE.TEST', mode == 'whitelist', mode + '-classical-geosite-upper')
 
             for mode in ('blacklist', 'whitelist'):
                 with run_case(mode, ['geosite:fixture'], geosite=True) as (_, port, _, _):

@@ -46,9 +46,7 @@ pub(crate) fn build(
         if key.contains(':') {
             let keys = expand_policy_keys(key);
             if keys.is_empty() {
-                // An empty prefixed list must still diagnose its missing name.
-                build_reference(key, geosite, providers)
-                    .map_err(|error| anyhow!("dns.fake-ip-filter[{index}]: {error}"))?;
+                bail!("dns.fake-ip-filter[{index}]: reference list is empty; expected a geosite category or rule-set name");
             }
             for key in keys {
                 let matcher = build_reference(&key, geosite, providers)
@@ -408,6 +406,10 @@ rule-providers:
             "rule-set:CIDRs",
             "rule-set:",
             "geosite:",
+            "geosite:,,",
+            "geosite: , , ",
+            "rule-set:,,",
+            "rule-set: , , ",
             "unsupported:x",
         ] {
             dns.fake_ip_filter = Some(vec![key.to_string()]);
