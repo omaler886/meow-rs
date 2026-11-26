@@ -243,11 +243,12 @@ How each loop-avoidance piece works:
    connect/bind, so its packets take the physical route regardless of the
    routing table: `SO_BINDTODEVICE` on Linux, `IP_BOUND_IF` /
    `IPV6_BOUND_IF` on macOS, `IP_UNICAST_IF` / `IPV6_UNICAST_IF` on
-   Windows. The interface is `tun.outbound-interface` if set (on Windows:
-   the interface *alias*, e.g. `Ethernet` or `Wi-Fi`), otherwise
-   auto-detected from the real IPv4 `0.0.0.0/0` route — the TUN's own `/1`
-   split routes are skipped, so detection is safe while a previous
-   listener's routes are still up. On macOS the default of a non-primary
+   Windows. Explicit socket bindings keep their existing priority: a node's
+   `interface-name`, then the top-level `interface-name`, then
+   `tun.outbound-interface` (the Windows interface *alias*, e.g. `Ethernet`).
+   Otherwise `auto-detect-interface: true` selects eligible physical routes
+   per socket, covering IPv4/IPv6 defaults and on-link routes. Every live
+   meow-owned TUN is excluded, including manually routed devices. On macOS the default of a non-primary
    interface (`netstat -rn` flag `I`) is skipped; on Windows the default
    with the lowest route + interface metric wins. The binding is installed
    as soon as the config is parsed, ahead of the first startup dial
@@ -492,6 +493,27 @@ curl.exe 1.1.1.1                       # captured (check meow logs)
 Get-NetRoute -DestinationPrefix 0.0.0.0/1, 128.0.0.0/1   # after stopping meow: none
 ```
 
+## Automatic interface changes
+
+With detection enabled, each new socket reads a current interface/route
+snapshot; route prefix length and effective metric select its eligible
+physical interface. Down, carrier-lost and loopback interfaces are excluded,
+as are all meow-owned TUN names. On Windows the metric combines the route and
+address-family interface metrics. The interface index is resolved again for
+new sockets, so replacing an adapter under the same name is followed.
+
+A one-second monitor tracks both address families, gateways, source addresses
+and link state. A changed physical network retires existing TCP/UDP sessions
+and pooled DNS/provider/proxy transports; callers must reconnect. A same-name,
+same-ifindex address change still counts. Missing physical defaults make new
+external dials fail closed, while eligible on-link routes remain usable. An
+explicit interface fixes selection; the monitor still observes that interface
+when auto-route or detection requests monitoring.
+
+The isolated Linux tests and exact source/binary evidence are documented in
+[TUN test builds](tun-test-build.md). Linux fixtures do not establish real
+Windows/macOS adapter handover behavior.
+
 ## `tun:` reference
 
 | Field | Default | Notes |
@@ -502,21 +524,22 @@ Get-NetRoute -DestinationPrefix 0.0.0.0/1, 128.0.0.0/1   # after stopping meow: 
 | `inet4-address` | first /30 of `dns.fake-ip-range` (`198.18.0.1/30`) | CIDR assigned to the device — a string, or mihomo's list form (only the first entry is used; `[]` is the default). Like mihomo, the default takes an address the fake-IP pool never hands out, outside LAN and Docker networks. A fixed private subnet can collide with one: a device on a Docker network's gateway address cuts the host off from that network's containers. |
 | `inet6-address` | none | IPv6 CIDR assigned to the device, e.g. `fdfe:dcba:9876::1/126` — a string, or mihomo's list form (only the first entry is used). Only honoured in global scope, where it also captures IPv6 (experimental, see above); ignored with a warning otherwise. An invalid CIDR is a hard error. |
 | `auto-route` | `true` | What to route into the device at startup (removed on shutdown): `true` = everything the host sends, IPv6 too with `inet6-address` (global scope; Linux, macOS and Windows, fake-ip scope elsewhere); `global` = the same; `fake-ip` = the fake-ip range only; `false` = nothing. See *Route scopes*. |
-| `outbound-interface` | auto-detect | Physical interface outbound sockets bind to in global scope — the interface name on Linux/macOS (`eth0`, `en0`), the interface alias on Windows (`Ethernet`). Ignored otherwise. |
+| `outbound-interface` | unset | Explicit fallback interface for TUN outbound sockets: Linux/macOS name (`eth0`, `en0`) or Windows alias (`Ethernet`). Per-node and top-level `interface-name` keep priority. Applies independently of auto-route scope. |
+| `auto-detect-interface` | `true` | Select physical routes for new outbound sockets when no explicit interface overrides it. Independent of `auto-route`; `false` with global routing requires an explicit interface and otherwise fails closed. Named `listeners: type: tun` defaults this flag to `false`. |
 | `dns-hijack` | on | In-process answering of UDP and TCP :53 flows entering the device, and in fake-ip mode the OS resolver redirect. Absent = on; a list with any `:53` entry = on; `[]` = off. Non-`:53` entries warn and are ignored. |
 | `stack` | `lwip` | `system` (or `mixed`): TCP is terminated by the host kernel — the pump rewrites each TCP packet's addresses to a kernel listener on the device address and back (a NAT inside the device subnet, so `inet4-address` needs a /31 or wider) — like mihomo's system stack; several times the throughput per CPU, and DIRECT flows splice in the kernel. UDP is parsed and built in the pump for both values — mihomo's `system` also uses the kernel for UDP and its `mixed` uses gVisor, so `mixed` maps to `system` here with a warning; IP fragments and IPv6 extension headers go to lwIP, which reassembles UDP, while fragmented TCP is dropped. Without TSO on TUN the device opens without offload. Linux only (Windows and macOS keep lwIP); `gvisor` and `mips` (mihomo's own stack) fall back to `lwip` with a warning. |
 | `udp-timeout` | `60` | Seconds of idle before a UDP flow is evicted. |
 | `max-connections` | `256` | Inherited from the top-level `max-connections` (`0` = unlimited); bounds **TCP** flows — on lwIP the slot is taken at accept, before the flow's 200 ms sniff window, so one that closes inside the window still occupies its slot briefly; under `stack: system` the slot is taken when the kernel accepts the connection, just before the window — a change while TUN runs restarts the listener. The UDP flow table has its own fixed bound (1024 live flows, least-recently-active eviction) that `max-connections` does not adjust. |
 
 mihomo fields meow does not implement (`strict-route`,
-`auto-detect-interface`, `mtu-v6`, `endpoint-independent-nat`,
+`auto-redirect`, `mtu-v6`, `endpoint-independent-nat`,
 UID filters, …) are accepted with a startup warning and ignored — same
 forward-compat policy as the rest of the config surface.
 
 Runtime reloads: `PUT /configs` reconciles the listener against the
 committed `tun:` section — an `enable` transition starts/stops it, and
-any other semantic parameter change (or changed fake-IP inputs)
-restarts it so the running stack matches the stored config (#543).
+any other semantic parameter change (including the effective outbound
+interface policy or changed fake-IP inputs) restarts it so the running stack matches the stored config (#543).
 No-op respellings and the warn-only fields above do not bounce the
 device; a failed (re)start — including the initial startup's — rolls
 committed `tun.enable` back to `false`, so a re-PUT of the same file

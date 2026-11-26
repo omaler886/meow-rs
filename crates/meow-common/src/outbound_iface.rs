@@ -1,4 +1,4 @@
-//! Outbound-socket interface binding for TUN global-route mode (#375).
+//! Outbound-socket interface binding for TUN route scopes (#375).
 //!
 //! In TUN global route scope (`tun.auto-route: true`, or `global`) the
 //! routes into the device send *all* traffic into the TUN device — including, without countermeasures, meow's
@@ -14,10 +14,9 @@
 //! | macOS | `IP_BOUND_IF` / `IPV6_BOUND_IF` | interface index |
 //! | Windows | `IP_UNICAST_IF` / `IPV6_UNICAST_IF` | interface index |
 //!
-//! The index-keyed platforms resolve the index once, at install time. An
-//! interface that is destroyed and re-created under the same name gets a
-//! new index, which the binding does not follow until it is re-installed
-//! (a TUN listener restart).
+//! Every new socket re-resolves the selected interface's index, and
+//! automatic bindings also select the interface per destination. A replaced
+//! interface is therefore followed without a TUN listener restart.
 //!
 //! Loopback destinations (`127.0.0.0/8`, `::1`, and the IPv4-mapped form)
 //! are left unbound on every platform (`binds_peer`): loopback traffic never
@@ -32,8 +31,9 @@
 //! rather than their wildcard local address.
 //!
 //! This module is the process-global registry for that interface, mirroring
-//! the `SocketProtector` pattern in [`crate::socket_protect`]: the owners of
-//! global route scope install the interface with
+//! the `SocketProtector` pattern in [`crate::socket_protect`]: TUN owners
+//! that need loop avoidance (global route scope, or `auto-detect-interface`
+//! independent of routes) install the interface with
 //! [`install_outbound_interface`], and the dial chokepoints
 //! ([`crate::connect_tcp`], [`crate::bind_udp`], plus the marked-socket path
 //! in `meow-proxy`) apply it to each socket.
@@ -69,32 +69,62 @@
 
 use crate::logbook;
 use std::io;
-#[cfg(any(
-    test,
-    all(
-        not(target_env = "ohos"),
-        any(target_os = "linux", target_os = "macos", target_os = "windows")
-    )
-))]
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use parking_lot::{Mutex, RwLock};
 
+/// Select the physical interface for a destination when TUN auto-detection is
+/// enabled. Implementations must return an existing interface name or an
+/// error; an error aborts socket setup and prevents an unbound routing loop.
+pub trait OutboundInterfaceFinder: Send + Sync + std::fmt::Debug {
+    /// Resolve the interface that should carry traffic to `destination`.
+    fn find_interface(&self, destination: IpAddr) -> io::Result<String>;
+}
+
+/// The network state a TUN monitor last retired transports for.
+///
+/// `fingerprint` identifies the observed interface/default/source-address
+/// set; `is_available` distinguishes a usable state from a loss. The pair is
+/// deliberately small and platform-neutral so the listener crate can record
+/// it on the shared owner without the common crate depending on route types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutboundNetworkAcknowledgement {
+    /// Opaque fingerprint of the acknowledged network state.
+    pub fingerprint: u64,
+    /// Whether that state had a usable outbound interface.
+    pub is_available: bool,
+}
+
+/// One consistent read of the binding in effect, used when a new owner wants
+/// to inherit the running configuration's last acknowledged network state.
+#[derive(Debug, Clone, Default)]
+pub struct OutboundInterfaceSnapshot {
+    /// Interface in effect, or `None` when no owner is installed.
+    pub interface: Option<Arc<str>>,
+    /// Whether that owner selects an interface per destination.
+    pub auto_detect: bool,
+    /// Last network state whose transports were retired, if any.
+    pub network: Option<OutboundNetworkAcknowledgement>,
+}
+
 /// One live owner of the binding.
 struct Owner {
     id: u64,
     iface: Arc<str>,
-    /// OS interface index, resolved when the owner installed. What the
-    /// index-keyed platforms bind to; Linux binds by name.
-    #[cfg_attr(
-        not(any(target_os = "linux", target_os = "macos", target_os = "windows")),
-        allow(dead_code, reason = "read only by the linux/macos/windows bind paths")
-    )]
+    /// Last resolved OS interface index, used to detect an index-only change
+    /// (an interface destroyed and re-created under the same name).
     index: u32,
+    /// Optional destination-aware interface selection used by mihomo's
+    /// `auto-detect-interface` TUN option.
+    finder: Option<Arc<dyn OutboundInterfaceFinder>>,
     /// Its configuration runs ([`OutboundIfaceGuard::commit`]).
     committed: bool,
+    /// Last network state the owner's monitor acknowledged after retiring
+    /// the transports bound before it. Superseded owners keep their own
+    /// value so a rejected reload restores the running owner's baseline.
+    network: Mutex<Option<OutboundNetworkAcknowledgement>>,
 }
 
 /// The socket option the binding uses on this platform, for log lines.
@@ -138,6 +168,35 @@ impl OutboundIfaceGuard {
         &self.iface
     }
 
+    /// Whether this owner currently controls outbound bindings rather than
+    /// being superseded by an in-flight reload candidate.
+    pub fn is_effective(&self) -> bool {
+        OWNERS
+            .read()
+            .last()
+            .is_some_and(|owner| owner.id == self.id)
+    }
+
+    /// Retire sessions and acknowledge their network only while effective.
+    /// The registry read lease prevents successor publication until `retire`
+    /// returns its acknowledgement. The callback must not re-enter this
+    /// registry and must perform only bounded, non-blocking cleanup.
+    /// Returns false for a superseded owner or a stale callback generation.
+    pub fn retire_network_if_effective(
+        &self,
+        retire: impl FnOnce() -> Option<OutboundNetworkAcknowledgement>,
+    ) -> bool {
+        let owners = OWNERS.read();
+        let Some(owner) = owners.last().filter(|owner| owner.id == self.id) else {
+            return false;
+        };
+        let Some(acknowledgement) = retire() else {
+            return false;
+        };
+        *owner.network.lock() = Some(acknowledgement);
+        true
+    }
+
     /// Mark this owner's configuration as running, which the logbook then
     /// records once it is the newest owner (see the [module docs](self)).
     /// Idempotent.
@@ -148,6 +207,41 @@ impl OutboundIfaceGuard {
         }
         settle(owners);
     }
+
+    /// Refresh this owner's fallback interface after a network change.
+    /// Returns true only when the live binding changed; superseded owners
+    /// remain updateable without disturbing a newer reload candidate.
+    pub fn refresh_interface(&self, name: &str) -> io::Result<bool> {
+        let index = validated_interface_index(name)?;
+        let mut owners = OWNERS.write();
+        let is_effective = owners.last().is_some_and(|owner| owner.id == self.id);
+        let owner = owners
+            .iter_mut()
+            .find(|owner| owner.id == self.id)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "outbound binding owner has stopped",
+                )
+            })?;
+        if owner.iface.as_ref() == name && owner.index == index {
+            return Ok(false);
+        }
+        owner.iface = Arc::from(name);
+        owner.index = index;
+        settle(owners);
+        Ok(is_effective)
+    }
+
+    /// Record the network state this owner's transports were last retired
+    /// for. The monitor calls this only after a successful flush; superseded
+    /// owners keep their own acknowledgement for a possible rollback.
+    pub fn acknowledge_network(&self, acknowledgement: OutboundNetworkAcknowledgement) {
+        let owners = OWNERS.read();
+        if let Some(owner) = owners.iter().find(|owner| owner.id == self.id) {
+            *owner.network.lock() = Some(acknowledgement);
+        }
+    }
 }
 
 impl Drop for OutboundIfaceGuard {
@@ -156,10 +250,10 @@ impl Drop for OutboundIfaceGuard {
         let Some(pos) = owners.iter().position(|o| o.id == self.id) else {
             return;
         };
-        owners.remove(pos);
+        let removed = owners.remove(pos);
         if pos == owners.len() {
             match owners.last() {
-                Some(o) if *o.iface == *self.iface => {}
+                Some(o) if *o.iface == *removed.iface => {}
                 Some(o) => tracing::info!(
                     "outbound interface binding restored to '{}' ({MECHANISM})",
                     o.iface
@@ -183,6 +277,22 @@ impl Drop for OutboundIfaceGuard {
 /// global-route mode, not a warning. On error the registry is left
 /// untouched.
 pub fn install_outbound_interface(name: &str) -> io::Result<OutboundIfaceGuard> {
+    install_outbound_interface_with_finder(name, None)
+}
+
+/// Install `name` as the fallback interface and optionally resolve a more
+/// specific interface for each destination before a socket is connected.
+pub fn install_outbound_interface_with_finder(
+    name: &str,
+    finder: Option<Arc<dyn OutboundInterfaceFinder>>,
+) -> io::Result<OutboundIfaceGuard> {
+    let index = validated_interface_index(name)?;
+    Ok(push_owner(Arc::from(name), index, finder))
+}
+
+/// Validate `name` and resolve its current interface index before publishing
+/// it or applying it to a new socket.
+fn validated_interface_index(name: &str) -> io::Result<u32> {
     if name.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -195,13 +305,12 @@ pub fn install_outbound_interface(name: &str) -> io::Result<OutboundIfaceGuard> 
             format!("outbound interface name '{name}' contains a NUL byte"),
         ));
     }
-    let index = interface_index(name)?.ok_or_else(|| {
+    interface_index(name)?.ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,
             format!("outbound interface '{name}' does not exist"),
         )
-    })?;
-    Ok(push_owner(Arc::from(name), index))
+    })
 }
 
 /// Resolve a NUL-free interface name to its index; `None` = no such
@@ -277,7 +386,11 @@ pub fn interface_metric_v4(index: u32) -> Option<u32> {
 }
 
 /// Register a validated interface as the newest owner.
-fn push_owner(iface: Arc<str>, index: u32) -> OutboundIfaceGuard {
+fn push_owner(
+    iface: Arc<str>,
+    index: u32,
+    finder: Option<Arc<dyn OutboundInterfaceFinder>>,
+) -> OutboundIfaceGuard {
     let id = NEXT_OWNER_ID.fetch_add(1, Ordering::Relaxed);
     let mut owners = OWNERS.write();
     let superseded = owners.last().map(|o| Arc::clone(&o.iface));
@@ -285,7 +398,9 @@ fn push_owner(iface: Arc<str>, index: u32) -> OutboundIfaceGuard {
         id,
         iface: Arc::clone(&iface),
         index,
+        finder,
         committed: false,
+        network: Mutex::new(None),
     });
     drop(owners);
     match &superseded {
@@ -358,6 +473,29 @@ pub fn outbound_interface() -> Option<Arc<str>> {
     OWNERS.read().last().map(|o| Arc::clone(&o.iface))
 }
 
+/// Whether the current outbound binding resolves interfaces per destination.
+pub fn outbound_interface_auto_detect() -> bool {
+    OWNERS
+        .read()
+        .last()
+        .is_some_and(|owner| owner.finder.is_some())
+}
+
+/// Snapshot the binding in effect — interface, selection strategy and last
+/// acknowledged network state — in one registry read.
+pub fn outbound_interface_snapshot() -> OutboundInterfaceSnapshot {
+    let owners = OWNERS.read();
+    let Some(owner) = owners.last() else {
+        return OutboundInterfaceSnapshot::default();
+    };
+    let network = *owner.network.lock();
+    OutboundInterfaceSnapshot {
+        interface: Some(Arc::clone(&owner.iface)),
+        auto_detect: owner.finder.is_some(),
+        network,
+    }
+}
+
 /// Whether traffic to `peer` takes the physical-interface binding: every
 /// destination but loopback (see the [module docs](self)), including the
 /// IPv4-mapped loopback form a dual-stack socket dials.
@@ -382,7 +520,9 @@ pub fn apply_outbound_interface_for_peer(
     peer: IpAddr,
 ) -> io::Result<()> {
     if binds_peer(peer) {
-        apply_outbound_interface(socket, domain)?;
+        if let Some((name, index)) = effective_binding(peer.to_canonical())? {
+            bind_socket(socket, domain, &name, index)?;
+        }
     }
     Ok(())
 }
@@ -396,14 +536,40 @@ pub fn apply_outbound_interface(
     socket: &socket2::Socket,
     domain: socket2::Domain,
 ) -> io::Result<()> {
-    let Some((name, index)) = OWNERS
-        .read()
-        .last()
-        .map(|o| (Arc::clone(&o.iface), o.index))
-    else {
-        return Ok(());
+    let peer = if domain == socket2::Domain::IPV6 {
+        IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
+    } else {
+        IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
     };
-    bind_socket(socket, domain, &name, index)
+    if let Some((name, index)) = effective_binding(peer)? {
+        bind_socket(socket, domain, &name, index)?;
+    }
+    Ok(())
+}
+
+/// Resolve the binding currently in effect, applying an optional
+/// destination-aware finder without holding the owner registry during the
+/// platform syscall.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn effective_binding(peer: IpAddr) -> io::Result<Option<(Arc<str>, u32)>> {
+    let Some((fallback_name, finder)) = OWNERS.read().last().map(|owner| {
+        (
+            Arc::clone(&owner.iface),
+            owner.finder.as_ref().map(Arc::clone),
+        )
+    }) else {
+        return Ok(None);
+    };
+    let Some(finder) = finder else {
+        // Explicit bindings validate at install time and re-resolve here so
+        // an interface destroyed and re-created under the same name (a new
+        // index on macOS/Windows) is followed, or fails closed if it is gone.
+        let index = validated_interface_index(&fallback_name)?;
+        return Ok(Some((fallback_name, index)));
+    };
+    let selected = finder.find_interface(peer)?;
+    let index = validated_interface_index(&selected)?;
+    Ok(Some((Arc::from(selected), index)))
 }
 
 /// Linux: `SO_BINDTODEVICE`, by name — one option covers both families.
@@ -600,7 +766,9 @@ mod pure_tests {
             id: 0,
             iface: Arc::from(iface),
             index: 1,
+            finder: None,
             committed,
+            network: Mutex::new(None),
         }
     }
 
@@ -724,6 +892,18 @@ mod tests {
         a.commit();
         a.commit();
         assert_eq!(recorded().as_deref(), Some(LO));
+        // The acknowledged network state travels with the owner, and a
+        // snapshot reads it together with the selection strategy.
+        let acknowledgement = OutboundNetworkAcknowledgement {
+            fingerprint: 7,
+            is_available: true,
+        };
+        assert_eq!(outbound_interface_snapshot().network, None);
+        a.acknowledge_network(acknowledgement);
+        let snapshot = outbound_interface_snapshot();
+        assert_eq!(snapshot.interface.as_deref(), Some(LO));
+        assert!(!snapshot.auto_detect, "loopback was installed fixed");
+        assert_eq!(snapshot.network, Some(acknowledgement));
         // Binding a fresh socket to loopback succeeds, in both families
         // and for both socket types.
         for domain in [socket2::Domain::IPV4, socket2::Domain::IPV6] {
@@ -741,6 +921,7 @@ mod tests {
         assert!(outbound_interface().is_none());
         assert_eq!(live_owners(), 0);
         assert_eq!(recorded(), None);
+        assert_eq!(outbound_interface_snapshot().network, None);
 
         // A rejected candidate: never committed, it records nothing, and
         // neither does the running owner it superseded taking over again.
@@ -836,6 +1017,74 @@ mod tests {
         assert_eq!(live_owners(), 1);
         drop(a);
         assert!(outbound_interface().is_none());
+        destination_finder_updates_fails_closed_and_restores();
+    }
+
+    #[derive(Debug)]
+    struct TestInterfaceFinder {
+        selected: RwLock<String>,
+        destinations: Mutex<Vec<IpAddr>>,
+    }
+
+    impl OutboundInterfaceFinder for TestInterfaceFinder {
+        /// Record the requested destination and return the test-controlled
+        /// interface name without performing network I/O.
+        fn find_interface(&self, destination: IpAddr) -> io::Result<String> {
+            self.destinations.lock().push(destination);
+            Ok(self.selected.read().clone())
+        }
+    }
+
+    /// Exercise dynamic selection within the serialized registry test so
+    /// concurrent socket tests cannot overwrite the active owner.
+    fn destination_finder_updates_fails_closed_and_restores() {
+        let finder = Arc::new(TestInterfaceFinder {
+            selected: RwLock::new(LO.into()),
+            destinations: Mutex::new(Vec::new()),
+        });
+        let guard = install_outbound_interface_with_finder(
+            LO,
+            Some(Arc::clone(&finder) as Arc<dyn OutboundInterfaceFinder>),
+        )
+        .unwrap();
+        assert!(outbound_interface_auto_detect());
+        let peer: IpAddr = "192.0.2.1".parse().unwrap();
+        let socket = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )
+        .unwrap();
+        // Loopback never consults the finder: it stays unbound by design.
+        apply_outbound_interface_for_peer(
+            &socket,
+            socket2::Domain::IPV4,
+            "127.0.0.1".parse().unwrap(),
+        )
+        .unwrap();
+        assert!(finder.destinations.lock().is_empty());
+        apply_outbound_interface_for_peer(&socket, socket2::Domain::IPV4, peer).unwrap();
+        assert_bound_to_loopback(&socket, socket2::Domain::IPV4);
+        assert_eq!(*finder.destinations.lock(), vec![peer]);
+        OWNERS.write().last_mut().unwrap().index = 0;
+        let resolved = effective_binding(peer).unwrap().unwrap();
+        assert_eq!(Some(resolved.1), interface_index(LO).unwrap());
+        assert!(guard.refresh_interface(LO).unwrap());
+        assert!(!guard.refresh_interface(LO).unwrap());
+        *finder.selected.write() = "no-such-iface-zz9".into();
+        assert!(effective_binding(peer).is_err());
+        let fixed = lo();
+        assert!(!outbound_interface_auto_detect());
+        // The explicit fallback re-resolves its index per socket rather than
+        // trusting the install-time value.
+        OWNERS.write().last_mut().unwrap().index = 0;
+        let resolved = effective_binding(peer).unwrap().unwrap();
+        assert_eq!(Some(resolved.1), interface_index(LO).unwrap());
+        assert!(!guard.refresh_interface(LO).unwrap());
+        drop(fixed);
+        assert!(effective_binding(peer).is_err());
+        drop(guard);
+        assert!(effective_binding(peer).unwrap().is_none());
     }
 
     /// The dial chokepoints behind `connect_tcp` / `bind_udp`, driven with

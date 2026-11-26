@@ -1184,7 +1184,7 @@ pub type RawHosts = IndexMap<String, HostsValue>;
 /// `tun:` YAML section (issue #326) — mihomo-compatible TUN inbound.
 ///
 /// Only the fields meow-rs implements are typed; upstream-only fields
-/// (`strict-route`, `auto-detect-interface`, `auto-redirect`, …) are
+/// (`strict-route`, `auto-redirect`, …) are
 /// accepted and produce a `warn!` (Class B per ADR-0002, forward-compat),
 /// never a parse error — the same policy as [`RawGeoDataConfig`] and #328.
 ///
@@ -1213,10 +1213,17 @@ pub struct RawTun {
     /// (`true` = capture all traffic where supported, `false` = off) plus
     /// the #375 mode strings `fake-ip` and `global`. Default true.
     pub auto_route: Option<RawAutoRoute>,
-    /// Physical interface outbound sockets bind to in global route scope
-    /// (loop avoidance, #375). Auto-detected from the default route when
-    /// omitted. Ignored in fake-IP scope.
+    /// Explicit physical interface outbound sockets bind to for this TUN;
+    /// if absent, `auto-detect-interface` may select one per destination.
     pub outbound_interface: Option<String>,
+    /// Resolve the physical interface for each outbound destination. This is
+    /// mihomo's destination-aware loop-protection mode and defaults to true.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_bool",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub auto_detect_interface: Option<bool>,
     /// DNS hijack targets. meow-rs hijacks all UDP :53 flows entering the
     /// device when this is absent or lists a `:53` target; `[]` turns it
     /// off, and entries with a port other than 53 warn and are ignored.
@@ -1234,7 +1241,6 @@ pub struct RawTun {
     pub stack: Option<serde_json::Value>,
     // Upstream-only fields accepted for forward-compat; warn and ignore.
     pub strict_route: Option<serde_json::Value>,
-    pub auto_detect_interface: Option<serde_json::Value>,
     pub auto_redirect: Option<serde_json::Value>,
     pub endpoint_independent_nat: Option<serde_json::Value>,
     pub mtu_v6: Option<serde_json::Value>,
@@ -1245,6 +1251,15 @@ pub struct RawTun {
     /// Unmodelled keys — warned on by `validation` (issue #974).
     #[serde(flatten)]
     pub extra: BTreeMap<String, UnknownYamlValue>,
+}
+
+/// Read a present boolean from `deserializer`, returning `Some(bool)` or a
+/// type error; omitted fields use their Serde default rather than accepting null.
+fn deserialize_non_null_bool<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    bool::deserialize(deserializer).map(Some)
 }
 
 /// `tun.auto-route` value: mihomo's boolean or a #375 mode string.
@@ -1358,7 +1373,14 @@ pub struct RawListener {
     // `extra` as unknown.
     pub dns_mode: Option<serde_json::Value>,
     pub strict_route: Option<serde_json::Value>,
-    pub auto_detect_interface: Option<serde_json::Value>,
+    /// Resolve the physical interface for each outbound destination. Named
+    /// listeners keep mihomo's explicit-value default of false.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_bool",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub auto_detect_interface: Option<bool>,
     pub auto_redirect: Option<serde_json::Value>,
     pub endpoint_independent_nat: Option<serde_json::Value>,
     pub mtu_v6: Option<serde_json::Value>,

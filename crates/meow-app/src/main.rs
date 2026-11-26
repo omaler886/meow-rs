@@ -301,13 +301,31 @@ fn init_logging(target: &LogTarget) -> Result<Logging> {
                 .with(log_layer)
                 .init();
             log::set_max_level(log_level);
-            meow_api::log_stream::install_log_reloader(move |level| {
-                let filter = tracing_subscriber::EnvFilter::new(normalize_level(level));
-                let log_level = log_max_level(&filter);
-                reload_handle.reload(filter).map_err(|e| e.to_string())?;
-                log::set_max_level(log_level);
-                Ok(())
-            });
+            let snapshot_handle = reload_handle.clone();
+            meow_api::log_stream::install_log_reloader_with_rollback(
+                move |level| {
+                    let filter = tracing_subscriber::EnvFilter::new(normalize_level(level));
+                    let log_level = log_max_level(&filter);
+                    reload_handle.reload(filter).map_err(|e| e.to_string())?;
+                    log::set_max_level(log_level);
+                    Ok(())
+                },
+                move || -> Result<meow_api::log_stream::LogRollbackAction, String> {
+                    let previous = snapshot_handle
+                        .with_current(ToString::to_string)
+                        .map_err(|e| e.to_string())?;
+                    let previous_max_level = log::max_level();
+                    let restore_handle = snapshot_handle.clone();
+                    Ok(Box::new(move || {
+                        // Parse the captured filter verbatim: normalization
+                        // here would alter case-sensitive RUST_LOG directives.
+                        let filter = tracing_subscriber::EnvFilter::new(previous);
+                        restore_handle.reload(filter).map_err(|e| e.to_string())?;
+                        log::set_max_level(previous_max_level);
+                        Ok(())
+                    }))
+                },
+            );
             Ok(Logging {
                 tx,
                 #[cfg(target_os = "windows")]
@@ -350,13 +368,31 @@ fn init_logging(target: &LogTarget) -> Result<Logging> {
                 .with(log_layer)
                 .init();
             log::set_max_level(log_level);
-            meow_api::log_stream::install_log_reloader(move |level| {
-                let filter = tracing_subscriber::EnvFilter::new(normalize_level(level));
-                let log_level = log_max_level(&filter);
-                reload_handle.reload(filter).map_err(|e| e.to_string())?;
-                log::set_max_level(log_level);
-                Ok(())
-            });
+            let snapshot_handle = reload_handle.clone();
+            meow_api::log_stream::install_log_reloader_with_rollback(
+                move |level| {
+                    let filter = tracing_subscriber::EnvFilter::new(normalize_level(level));
+                    let log_level = log_max_level(&filter);
+                    reload_handle.reload(filter).map_err(|e| e.to_string())?;
+                    log::set_max_level(log_level);
+                    Ok(())
+                },
+                move || -> Result<meow_api::log_stream::LogRollbackAction, String> {
+                    let previous = snapshot_handle
+                        .with_current(ToString::to_string)
+                        .map_err(|e| e.to_string())?;
+                    let previous_max_level = log::max_level();
+                    let restore_handle = snapshot_handle.clone();
+                    Ok(Box::new(move || {
+                        // Parse the captured filter verbatim: normalization
+                        // here would alter case-sensitive RUST_LOG directives.
+                        let filter = tracing_subscriber::EnvFilter::new(previous);
+                        restore_handle.reload(filter).map_err(|e| e.to_string())?;
+                        log::set_max_level(previous_max_level);
+                        Ok(())
+                    }))
+                },
+            );
             Ok(Logging {
                 tx,
                 _file_guard: Some(guard),
@@ -812,6 +848,22 @@ fn preinstall_global_route_binding(raw: &meow_config::raw::RawConfig) -> EarlyOu
 #[cfg(not(feature = "listener-tun"))]
 fn preinstall_global_route_binding(_raw: &meow_config::raw::RawConfig) -> EarlyOutboundBinding {
     None
+}
+
+/// Snapshot provider transport roots on a network change without retaining
+/// the provider registry after application shutdown.
+#[cfg(feature = "listener-tun")]
+fn tun_provider_roots(
+    providers: &Arc<DashMap<String, Arc<ProxyProvider>>>,
+) -> impl Fn() -> Vec<Arc<dyn meow_common::Proxy>> + Send + Sync + 'static {
+    let providers = Arc::downgrade(providers);
+    move || match providers.upgrade() {
+        Some(providers) => providers
+            .iter()
+            .flat_map(|entry| entry.value().proxies())
+            .collect(),
+        None => Vec::new(),
+    }
 }
 
 /// The cargo feature a `listeners:` entry needs when this binary did not
@@ -1557,6 +1609,12 @@ async fn run(
         }
         Arc::new(map)
     };
+    // Every TUN generation this process starts (including one spawned by an
+    // API reload) consults this weak snapshot, so a physical-interface change
+    // also retires provider transports outside the live route graph. The
+    // closure holds a `Weak`, so it never prolongs the registry.
+    #[cfg(feature = "listener-tun")]
+    meow_listener::tun::set_outbound_provider_roots(tun_provider_roots(&proxy_providers));
 
     // Rule providers in shared state for runtime refresh and API exposure.
     let rule_providers = Arc::new(RwLock::new(config.rule_providers));
@@ -1851,6 +1909,7 @@ async fn run(
                     nl.route_override.clone(),
                     Arc::clone(&sniffer_runtime),
                     early_binding.take(),
+                    &proxy_providers,
                 )
                 .await
                 {
@@ -2405,6 +2464,7 @@ async fn run(
             )
             .with_readiness_signal(ready_tx)
             .with_sniffer(Arc::clone(&sniffer_runtime))
+            .with_outbound_roots(tun_provider_roots(&proxy_providers))
             .with_tcp_dns_hijack(config.tun.dns_hijack);
             // The global-route binding installed before the config build
             // moves into the listener, which clears it with its routes —
@@ -2711,6 +2771,7 @@ async fn spawn_named_tun(
     route_override: Option<meow_common::InboundRouteOverride>,
     sniffer: Arc<SnifferRuntime>,
     binding: Option<meow_listener::OutboundBinding>,
+    proxy_providers: &Arc<DashMap<String, Arc<ProxyProvider>>>,
 ) -> Result<(), String> {
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let mut listener = TunListener::new(
@@ -2720,6 +2781,7 @@ async fn spawn_named_tun(
     )
     .with_readiness_signal(ready_tx)
     .with_sniffer(sniffer)
+    .with_outbound_roots(tun_provider_roots(proxy_providers))
     .with_route_override(route_override);
     if let Some(binding) = binding {
         listener = listener.with_outbound_binding(binding);
@@ -3713,10 +3775,11 @@ mod tests {
         }
     }
 
-    /// #695: the global-route binding is installed from the raw config,
-    /// ahead of the build's first dial, only for an enabled TUN in global
-    /// route scope (`auto-route` unset, `true` or `global`) — TUN-off and
-    /// fake-IP startups never touch the process-global registry.
+    /// #695: the outbound binding is installed from the raw config, ahead
+    /// of the build's first dial, when the effective TUN enables
+    /// `auto-detect-interface` (the default for the top-level `tun:`), sets
+    /// an explicit interface, or uses global route scope. Explicit
+    /// detection-off only suppresses detection, not an explicit interface.
     #[cfg(all(
         feature = "listener-tun",
         any(target_os = "linux", target_os = "macos")
@@ -3740,14 +3803,21 @@ mod tests {
         /// One test drives every case because the registry is
         /// process-global; separate `#[test]` fns would race each other.
         #[test]
-        fn preinstalls_only_for_global_route_scope() {
+        fn preinstalls_for_detection_explicit_or_global_route_scope() {
             assert!(meow_common::outbound_interface().is_none());
 
             for yaml in [
                 "port: 7890\n",
                 "tun:\n  enable: false\n  auto-route: global\n  outbound-interface: LO\n",
-                "tun:\n  enable: true\n  auto-route: fake-ip\n  outbound-interface: LO\n",
-                "tun:\n  enable: true\n  auto-route: false\n",
+                "tun:\n  enable: true\n  auto-route: false\n  auto-detect-interface: false\n",
+                "tun:\n  enable: true\n  auto-route: fake-ip\n  auto-detect-interface: false\n",
+                // A global `interface-name` is its own per-dial policy; it
+                // does not by itself install the TUN-owned binding.
+                "interface-name: LO\ntun:\n  enable: true\n  auto-route: fake-ip\n  \
+                 auto-detect-interface: false\n",
+                // Named TUNs default detection to false (mihomo's named
+                // entry semantics) and are consulted at startup.
+                "listeners:\n  - name: tun0\n    type: tun\n",
                 // Rejected later by `build_config`; never pre-installs.
                 "tun:\n  enable: true\n  auto-route: bogus\n  outbound-interface: LO\n",
             ] {
@@ -3769,9 +3839,18 @@ mod tests {
                 "tun:\n  enable: true\n  outbound-interface: LO\n",
                 "tun:\n  enable: true\n  auto-route: true\n  outbound-interface: LO\n",
                 "tun:\n  enable: true\n  auto-route: global\n  outbound-interface: LO\n",
+                // An explicit interface binds independently of route scope
+                // and of the detection switch, matching the policy.
+                "tun:\n  enable: true\n  auto-route: fake-ip\n  outbound-interface: LO\n",
+                "tun:\n  enable: true\n  auto-route: false\n  \
+                 auto-detect-interface: false\n  outbound-interface: LO\n",
+                "interface-name: LO\ntun:\n  enable: true\n  auto-route: fake-ip\n  \
+                 auto-detect-interface: true\n",
+                "listeners:\n  - name: tun0\n    type: tun\n    auto-route: global\n    \
+                 outbound-interface: LO\n",
             ] {
                 let binding = preinstall_global_route_binding(&raw(global))
-                    .expect("global route scope pre-installs the binding");
+                    .expect("the policy pre-installs the binding");
                 assert_eq!(
                     meow_common::outbound_interface().as_deref(),
                     Some(LO),

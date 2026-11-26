@@ -177,7 +177,7 @@ tun:
     );
 }
 
-// ─── T8: upstream-only fields accepted with a warning ─────────────────────
+// ─── T8: auto-detect-interface is typed and defaults on ───────────────────
 
 #[tokio::test]
 async fn t8_upstream_only_fields_warn_but_load() {
@@ -185,12 +185,62 @@ async fn t8_upstream_only_fields_warn_but_load() {
 tun:
   enable: true
   strict-route: true
-  auto-detect-interface: true
   inet6-address: fdfe:dcba:9876::1/126
   endpoint-independent-nat: false
 "#;
     let cfg = load_config_from_str(yaml).await.expect("config must load");
     assert!(cfg.tun.enable, "unsupported fields are warn-only");
+    assert!(cfg.tun.auto_detect_interface);
+}
+
+/// Verify typed detection and route-independent defaults using local YAML.
+#[tokio::test]
+async fn t8c_auto_detect_interface_is_typed_and_independent_of_routes() {
+    let load = |yaml: &'static str| async move {
+        load_config_from_str(yaml)
+            .await
+            .expect("config must load")
+            .tun
+    };
+    assert!(load("tun:\n  enable: true\n").await.auto_detect_interface);
+    assert!(
+        load("tun:\n  enable: true\n  auto-route: fake-ip\n")
+            .await
+            .auto_detect_interface
+    );
+    assert!(
+        load("tun:\n  enable: true\n  auto-route: false\n")
+            .await
+            .auto_detect_interface
+    );
+    assert!(
+        !load("tun:\n  enable: true\n  auto-detect-interface: false\n")
+            .await
+            .auto_detect_interface
+    );
+    assert!(
+        load("tun:\n  enable: true\n  auto-detect-interface: true\n")
+            .await
+            .auto_detect_interface
+    );
+    for yaml in [
+        "tun:\n  enable: true\n  auto-detect-interface: yes\n",
+        "tun:\n  enable: true\n  auto-detect-interface: 1\n",
+        "tun:\n  enable: true\n  auto-detect-interface: null\n",
+    ] {
+        assert!(
+            load_config_from_str(yaml).await.is_err(),
+            "invalid boolean must fail: {yaml}"
+        );
+    }
+    let omitted = meow_config::raw::RawTun::default();
+    let serialized = serde_json::to_value(&omitted).unwrap();
+    assert!(serialized.get("auto-detect-interface").is_none());
+    assert_eq!(
+        serde_json::from_value::<meow_config::raw::RawTun>(serialized).unwrap(),
+        omitted,
+        "an omitted boolean must remain deserializable after serialization"
+    );
 }
 
 // ─── T8b: inet6-address (#375) ────────────────────────────────────────────
@@ -456,17 +506,16 @@ async fn t16_tun_config_semantic_equality_boundary() {
         "inherited max-connections must differ"
     );
 
-    // `outbound-interface` is ignored outside global scope — a value that
-    // does nothing must not reach the diff, or a PUT touching only it
-    // would bounce a healthy fake-ip listener (issue #543 review).
-    let ignored_iface =
+    // Explicit interface and detection are effective even outside global
+    // route scope because they govern outbound sockets, not route capture.
+    let explicit_iface =
         tun("tun:\n  enable: true\n  auto-route: fake-ip\n  outbound-interface: eth9\n").await;
-    assert_eq!(
-        fake_ip_mode, ignored_iface,
-        "outbound-interface under fake-ip scope must not change the diff"
+    assert_ne!(
+        fake_ip_mode, explicit_iface,
+        "interface binding is effective"
     );
     assert_ne!(
-        ignored_iface,
+        explicit_iface,
         tun("tun:\n  enable: true\n  auto-route: global\n  outbound-interface: eth9\n").await,
         "the same field under `global` is real and must differ"
     );
@@ -548,6 +597,114 @@ async fn t17_global_route_gate_matches_parsed_config() {
         );
         assert_eq!(gate("tun:\n  enable: true\n"), Some(None));
     }
+}
+
+/// Verify effective binding policies from local YAML without installing bindings.
+#[test]
+fn t17b_effective_tun_outbound_binding_policy() {
+    use meow_config::{parse_raw_yaml, TunOutboundBindingPolicy};
+
+    let policy =
+        |yaml: &str| meow_config::tun_outbound_binding_policy(&parse_raw_yaml(yaml).unwrap());
+    assert_eq!(policy("port: 7890\n"), None);
+    assert_eq!(policy("tun:\n  enable: false\n"), None);
+    for empty_global in ["", "   "] {
+        assert_eq!(
+            policy(&format!(
+                "interface-name: '{empty_global}'\ntun:\n  enable: true\n"
+            )),
+            Some(TunOutboundBindingPolicy {
+                interface: None,
+                auto_detect_interface: true,
+            }),
+            "empty global interface must restore automatic selection"
+        );
+    }
+    assert_eq!(policy("listeners:\n  - name: t\n    type: tun\n"), None);
+    assert_eq!(
+        policy("tun:\n  enable: true\n  auto-route: false\n  auto-detect-interface: false\n"),
+        None
+    );
+    assert_eq!(
+        policy("tun:\n  enable: true\n  auto-route: fake-ip\n"),
+        Some(TunOutboundBindingPolicy {
+            interface: None,
+            auto_detect_interface: true,
+        })
+    );
+    assert_eq!(
+        policy("tun:\n  enable: true\n  auto-route: false\n"),
+        Some(TunOutboundBindingPolicy {
+            interface: None,
+            auto_detect_interface: true,
+        }),
+        "detection applies without automatic routes"
+    );
+    assert_eq!(
+        policy("tun:\n  enable: true\n  auto-route: fake-ip\n  auto-detect-interface: false\n"),
+        None,
+        "no binding is required when both route binding and detection are off"
+    );
+    assert_eq!(
+        policy("tun:\n  enable: true\n  auto-route: global\n  auto-detect-interface: false\n"),
+        Some(TunOutboundBindingPolicy {
+            interface: None,
+            auto_detect_interface: false,
+        }),
+        "global route without an interface preserves fail-closed install policy"
+    );
+    assert_eq!(
+        policy("tun:\n  enable: true\n  auto-route: fake-ip\n  outbound-interface: eth9\n"),
+        Some(TunOutboundBindingPolicy {
+            interface: Some("eth9".to_owned()),
+            auto_detect_interface: false,
+        })
+    );
+    assert_eq!(
+        policy("interface-name: eth0\ntun:\n  enable: true\n  auto-route: global\n"),
+        Some(TunOutboundBindingPolicy {
+            interface: Some("eth0".to_owned()),
+            auto_detect_interface: false,
+        }),
+        "global interface-name overrides detection"
+    );
+    assert_eq!(
+        policy("interface-name: eth0\ntun:\n  enable: true\n  auto-route: false\n  auto-detect-interface: false\n  outbound-interface: eth9\n"),
+        Some(TunOutboundBindingPolicy {
+            interface: Some("eth0".to_owned()),
+            auto_detect_interface: false,
+        }),
+        "global interface overrides the TUN fallback consistently with socket binding"
+    );
+    assert_eq!(
+        policy("interface-name: eth0\ntun:\n  enable: true\n  auto-route: false\n"),
+        Some(TunOutboundBindingPolicy {
+            interface: Some("eth0".to_owned()),
+            auto_detect_interface: false,
+        }),
+        "an explicit global interface replaces requested detection"
+    );
+    assert_eq!(
+        policy("listeners:\n  - name: t\n    type: tun\n    auto-detect-interface: true\n"),
+        Some(TunOutboundBindingPolicy {
+            interface: None,
+            auto_detect_interface: true,
+        }),
+        "named detection is effective despite named auto-route defaulting off"
+    );
+    assert_eq!(
+        policy("interface-name: eth0\nlisteners:\n  - name: t\n    type: tun\n    auto-route: global\n    outbound-interface: eth9\n"),
+        Some(TunOutboundBindingPolicy {
+            interface: Some("eth0".to_owned()),
+            auto_detect_interface: false,
+        }),
+        "named TUN uses the same global interface precedence"
+    );
+    assert_eq!(
+        policy("tun:\n  enable: true\n  auto-route: fake-ip\n  auto-detect-interface: false\nlisteners:\n  - name: t\n    type: tun\n    auto-route: global\n"),
+        None,
+        "enabled top-level TUN has priority over a named TUN"
+    );
 }
 
 // ─── T18: the default address follows the fake-IP range ──────────────────

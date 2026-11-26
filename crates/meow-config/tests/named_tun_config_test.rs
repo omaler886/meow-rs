@@ -332,10 +332,41 @@ async fn nt11_socket_only_fields_warn_not_error() {
 #[tokio::test]
 async fn nt11_unsupported_upstream_fields_warn_not_error() {
     let cfg = build_tun(&tun_yaml(
-        "    auto-detect-interface: true\n    strict-route: true\n    dns-mode: fake-ip\n    gso: true\n",
+        "    strict-route: true\n    dns-mode: fake-ip\n    gso: true\n",
     ))
     .await;
     assert!(cfg.enable);
+}
+
+/// Verify named-TUN detection defaults, boolean validation and raw round trips.
+#[tokio::test]
+async fn nt11b_auto_detect_interface_defaults_off_and_is_typed() {
+    assert!(!build_tun(&tun_yaml("")).await.auto_detect_interface);
+    assert!(
+        build_tun(&tun_yaml("    auto-detect-interface: true\n"))
+            .await
+            .auto_detect_interface
+    );
+    assert!(
+        !build_tun(&tun_yaml("    auto-detect-interface: false\n"))
+            .await
+            .auto_detect_interface
+    );
+    for value in ["yes", "1", "null"] {
+        let yaml = tun_yaml(&format!("    auto-detect-interface: {value}\n"));
+        assert!(
+            serde_saphyr::from_str::<meow_config::raw::RawConfig>(&yaml).is_err(),
+            "invalid boolean must fail: {value}"
+        );
+    }
+    let raw = meow_config::parse_raw_yaml(&tun_yaml("")).unwrap();
+    let listener = &raw.listeners.as_ref().unwrap()[0];
+    let serialized = serde_json::to_value(listener).unwrap();
+    assert!(serialized.get("auto-detect-interface").is_none());
+    assert_eq!(
+        serde_json::from_value::<meow_config::raw::RawListener>(serialized).unwrap(),
+        *listener
+    );
 }
 
 // ─── NT12: early-binding helper agrees with the spec ────────────────────

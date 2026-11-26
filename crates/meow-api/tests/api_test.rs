@@ -10175,7 +10175,7 @@ async fn patch_configs_tun_disable_stops_listener_and_round_trips() {
     let before = get_configs_json(&state).await;
     assert_eq!(
         before["tun"],
-        serde_json::json!({"enable": true, "mtu": 1500})
+        serde_json::json!({"enable": true, "mtu": 1500, "auto-detect-interface": true})
     );
     assert_eq!(before["tun-enable"], true);
 
@@ -10199,7 +10199,7 @@ async fn patch_configs_tun_disable_stops_listener_and_round_trips() {
     let after = get_configs_json(&state).await;
     assert_eq!(
         after["tun"],
-        serde_json::json!({"enable": false, "mtu": 1500})
+        serde_json::json!({"enable": false, "mtu": 1500, "auto-detect-interface": true})
     );
     assert_eq!(after["tun-enable"], false);
 }
@@ -10215,7 +10215,7 @@ async fn patch_configs_tun_enable_without_listener_tun_fails_and_rolls_back() {
     let state = test_state(test_raw_config());
     assert_eq!(
         get_configs_json(&state).await["tun"],
-        serde_json::json!({"enable": false}),
+        serde_json::json!({"enable": false, "auto-detect-interface": true}),
         "no tun: section still reports the switch"
     );
 
@@ -10377,6 +10377,7 @@ async fn patch_configs_tun_merges_over_committed_section() {
             "device": "utun9",
             "mtu": 1400,
             "auto-route": "global",
+            "auto-detect-interface": true,
             "dns-hijack": ["any:53"],
         })
     );
@@ -10531,7 +10532,7 @@ async fn put_configs_force_garbage_inet4_address_never_reports_non_string() {
     }
 }
 
-/// Unknown keys — mihomo's upstream-only `tun` keys and other top-level
+/// Implemented TUN detection is committed while unknown `tun` keys and top-level
 /// sections (Clash Party sends `dns` with its TUN switch) — are ignored,
 /// not stored and not rejected.
 #[tokio::test]
@@ -10557,8 +10558,48 @@ async fn patch_configs_tun_ignores_unknown_keys() {
     let tun = state.raw_config.read().tun.clone().unwrap();
     assert_eq!(tun.device.as_deref(), Some("utun9"));
     assert!(tun.strict_route.is_none());
-    assert!(tun.auto_detect_interface.is_none());
+    assert_eq!(tun.auto_detect_interface, Some(true));
     assert!(state.raw_config.read().dns.is_none());
+}
+
+/// Verify detection boolean PATCH/GET round trips and null-as-absent semantics
+/// against a disabled listener; uses no external inputs or TUN device.
+#[tokio::test]
+async fn patch_configs_tun_auto_detect_interface_commits_and_echoes() {
+    let _globals_lane = process_globals_lane().await;
+    let state = test_state(test_raw_config());
+    for is_enabled in [false, true, false] {
+        let resp = patch_configs(
+            &state,
+            serde_json::json!({"tun": {"enable": false, "auto-detect-interface": is_enabled}}),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            state
+                .raw_config
+                .read()
+                .tun
+                .as_ref()
+                .unwrap()
+                .auto_detect_interface,
+            Some(is_enabled)
+        );
+        assert_eq!(
+            get_configs_json(&state).await["tun"]["auto-detect-interface"],
+            serde_json::json!(is_enabled)
+        );
+    }
+    let resp = patch_configs(
+        &state,
+        serde_json::json!({"tun": {"auto-detect-interface": null}}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        get_configs_json(&state).await["tun"]["auto-detect-interface"],
+        serde_json::json!(false)
+    );
 }
 
 /// `stack` is an implemented `tun:` key, not an upstream-only leftover:
@@ -10613,7 +10654,7 @@ async fn patch_configs_tun_stack_commits_and_echoes() {
     assert_eq!(tun.stack, Some(serde_json::json!("system")));
     assert_eq!(
         get_configs_json(&state).await["tun"],
-        serde_json::json!({"enable": false, "mtu": 1500, "stack": "system"}),
+        serde_json::json!({"enable": false, "mtu": 1500, "stack": "system", "auto-detect-interface": true}),
     );
 }
 

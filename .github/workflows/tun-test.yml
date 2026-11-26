@@ -1,0 +1,532 @@
+name: Personal TUN test build
+
+# Fork-only test branches/manual dispatch; no PR, tag, schedule or publishing.
+on:
+  push:
+    branches:
+      - 'tun-port-test'
+      - 'tun-*'
+      - 'tun-port-test/tun-*'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch, tag, or SHA to test (blank uses the selected commit)'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tun-test-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_PROFILE_DEV_DEBUG: '0'
+  CARGO_PROFILE_TEST_DEBUG: '0'
+  RUST_BACKTRACE: '1'
+  LLVM_VERSION: '18.1.8'
+
+jobs:
+  source:
+    if: github.event.repository.fork == true
+    name: Resolve one immutable source commit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      sha: ${{ steps.source.outputs.sha }}
+      short_sha: ${{ steps.source.outputs.short_sha }}
+      base_version: ${{ steps.source.outputs.base_version }}
+      toolchain: ${{ steps.source.outputs.toolchain }}
+    steps:
+      - name: Resolve selected ref
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+
+      - name: Record source and build identifiers
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha=$(git rev-parse --verify HEAD)
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
+          base_version=$(sed -nE '/^\[workspace\.package\]/,/^\[/ s/^version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' Cargo.toml | head -n1)
+          [[ "$base_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          toolchain=$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' rust-toolchain.toml | head -n1)
+          [[ "$toolchain" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          {
+            echo "sha=$sha"
+            echo "short_sha=${sha:0:7}"
+            echo "base_version=$base_version"
+            echo "toolchain=$toolchain"
+          } | tee -a "$GITHUB_OUTPUT"
+
+  build:
+    if: github.event.repository.fork == true
+    name: Build test and Alpha for ${{ matrix.target }}
+    needs: source
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    env:
+      SOURCE_SHA: ${{ needs.source.outputs.sha }}
+      SHORT_SHA: ${{ needs.source.outputs.short_sha }}
+      BASE_VERSION: ${{ needs.source.outputs.base_version }}
+      PINNED_TOOLCHAIN: ${{ needs.source.outputs.toolchain }}
+      TARGET: ${{ matrix.target }}
+      BINARY: ${{ matrix.binary }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            binary: meow
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            binary: meow
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            binary: meow.exe
+    steps:
+      - name: Check out the resolved source SHA
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.source.outputs.sha }}
+          persist-credentials: false
+
+      - name: Verify checkout and install pinned Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$(git rev-parse HEAD)" = "$SOURCE_SHA" ]]
+          [[ -z "$(git status --porcelain --untracked-files=no)" ]]
+          rustup toolchain install "$PINNED_TOOLCHAIN" --profile minimal --no-self-update
+          rustup target add --toolchain "$PINNED_TOOLCHAIN" "$TARGET"
+          echo "RUSTUP_TOOLCHAIN=$PINNED_TOOLCHAIN" >> "$GITHUB_ENV"
+
+      - name: Cache Rust build output
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          key: tun-${{ matrix.target }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
+
+      - name: Install Linux native dependencies
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake clang libclang-dev pkg-config
+
+      - name: Install macOS native dependencies
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          brew list cmake >/dev/null 2>&1 || brew install cmake
+
+      # lwIP and boring-sys both use bindgen; match the Windows TUN CI pin.
+      - name: Install LLVM for bindgen
+        uses: KyleMayes/install-llvm-action@v2
+        with:
+          version: ${{ env.LLVM_VERSION }}
+
+      - name: Prepare Wintun for the Windows builds
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/wintun"
+          bash scripts/fetch-wintun.sh --target "$TARGET" --outdir "$RUNNER_TEMP/wintun"
+          echo "MEOW_WINTUN_DLL=$RUNNER_TEMP/wintun/wintun.dll" >> "$GITHUB_ENV"
+
+      - name: Assert and preserve the full TUN feature graph
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo tree --locked -p meow-app --no-default-features --features full \
+            --target "$TARGET" -e features > "$RUNNER_TEMP/tun-feature-graph.txt"
+          grep -F 'listener-tun' "$RUNNER_TEMP/tun-feature-graph.txt"
+
+      # Sequential builds share native/Rust dependencies. Freeze each binary
+      # before Cargo rebuilds the app for the other version suffix.
+      - name: Build and identify both full-feature TUN binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          for flavor in test alpha; do
+            suffix=''
+            [[ "$flavor" != alpha ]] || suffix="-alpha+$SHORT_SHA"
+            export MEOW_VERSION_SUFFIX="$suffix"
+            cargo build --release --locked -p meow-app --no-default-features --features full \
+              --target "$TARGET" --bin meow
+            out="$RUNNER_TEMP/tun-artifact/$flavor"
+            mkdir -p "$out"
+            cp "target/$TARGET/release/$BINARY" "$out/$BINARY"
+            chmod 755 "$out/$BINARY"
+            version=$("$out/$BINARY" --version | tr -d '\r')
+            [[ "$version" = "meow $BASE_VERSION$suffix" ]]
+            (
+              cd "$out"
+              if [[ "$RUNNER_OS" = macOS ]]; then
+                shasum -a 256 "$BINARY" > "$BINARY.sha256"
+              else
+                sha256sum "$BINARY" > "$BINARY.sha256"
+              fi
+            )
+            read -r binary_sha256 _ < "$out/$BINARY.sha256"
+            {
+              echo "source_sha=$SOURCE_SHA"
+              echo "source_tree=$(git rev-parse 'HEAD^{tree}')"
+              echo "flavor=$flavor"
+              echo "target=$TARGET"
+              echo "toolchain=$PINNED_TOOLCHAIN"
+              echo "version=$version"
+              echo "binary_sha256=$binary_sha256"
+              echo "run_id=$GITHUB_RUN_ID"
+              echo "run_attempt=$GITHUB_RUN_ATTEMPT"
+              printf 'build_command=MEOW_VERSION_SUFFIX=%s cargo build --release --locked -p meow-app --no-default-features --features full --target %s --bin meow\n' "$suffix" "$TARGET"
+            } | tee "$out/build-info.txt"
+            rustc --version --verbose > "$out/toolchain.txt"
+            cargo --version >> "$out/toolchain.txt"
+            cp "$RUNNER_TEMP/tun-feature-graph.txt" "$out/feature-graph.txt"
+          done
+
+      - name: Upload immutable test binary and provenance
+        uses: actions/upload-artifact@v4
+        with:
+          name: meow-tun-test-${{ matrix.target }}-${{ needs.source.outputs.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/tun-artifact/test/*
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload immutable Alpha binary and provenance
+        uses: actions/upload-artifact@v4
+        with:
+          name: meow-tun-alpha-${{ matrix.target }}-${{ needs.source.outputs.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/tun-artifact/alpha/*
+          if-no-files-found: error
+          retention-days: 14
+
+  quality-gates:
+    if: github.event.repository.fork == true
+    name: Formatting, feature matrices and FakeIP source regressions
+    needs: source
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      SOURCE_SHA: ${{ needs.source.outputs.sha }}
+      PINNED_TOOLCHAIN: ${{ needs.source.outputs.toolchain }}
+      MEOW_VERSION_SUFFIX: ''
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Check out the resolved source SHA
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.source.outputs.sha }}
+          persist-credentials: false
+
+      - name: Verify clean source and install pinned quality toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$(git rev-parse HEAD)" = "$SOURCE_SHA" ]]
+          [[ -z "$(git status --porcelain --untracked-files=no)" ]]
+          rustup toolchain install "$PINNED_TOOLCHAIN" --profile minimal --no-self-update
+          rustup component add --toolchain "$PINNED_TOOLCHAIN" rustfmt clippy
+          echo "RUSTUP_TOOLCHAIN=$PINNED_TOOLCHAIN" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/tun-quality"
+          printf 'source_sha=%s\nsource_tree=%s\ntoolchain=%s\n' \
+            "$SOURCE_SHA" "$(git rev-parse 'HEAD^{tree}')" "$PINNED_TOOLCHAIN" \
+            > "$RUNNER_TEMP/tun-quality/source.txt"
+          rustc +"$PINNED_TOOLCHAIN" --version --verbose >> "$RUNNER_TEMP/tun-quality/source.txt"
+
+      - name: Cache quality build output
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          key: tun-quality-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
+
+      - name: Install native quality dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake clang libclang-dev pkg-config
+
+      - name: Install LLVM for quality bindgen
+        uses: KyleMayes/install-llvm-action@v2
+        with:
+          version: ${{ env.LLVM_VERSION }}
+
+      - name: Formatting and strict Clippy feature matrix
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            set -x
+            cargo fmt --all -- --check
+            cargo clippy --locked --all-targets -- -D warnings
+            cargo clippy --locked --all-targets --no-default-features -- -D warnings
+            cargo clippy --locked --all-targets --all-features -- -D warnings
+            cargo clippy --locked -p meow-common --all-targets -- -D warnings
+          } 2>&1 | tee "$RUNNER_TEMP/tun-quality/clippy.log"
+
+      - name: DNS, config, rules, tunnel, API and library regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            set -x
+            cargo test --locked -p meow-dns --lib --tests
+            cargo test --locked -p meow-config --lib --test fakeip_filter_rules --test dns_response_rules --test config_test
+            cargo test --locked -p meow-app --test offline_config_test
+            cargo test --locked -p meow-rules --lib --test rules_test
+            cargo test --locked -p meow-tunnel --test fakeip_test
+            cargo test --locked -p meow-api --test api_test --test patch_tun_interface_lifecycle
+            cargo test --locked --workspace --lib
+            cargo test --locked -p meow-listener --all-features --lib udp_port_53
+            cargo test --locked -p meow-dns --features quic-dns --test quic_dns_integration
+            cargo test --locked -p meow-common --lib -- logbook traffic_ledger
+          } 2>&1 | tee "$RUNNER_TEMP/tun-quality/regressions.log"
+
+      - name: Minimal bundle and strict rustdoc
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            set -x
+            cargo check --locked -p meow-app --no-default-features --features minimal --bin meow
+            RUSTDOCFLAGS=-Dwarnings cargo doc --locked --workspace --no-deps
+          } 2>&1 | tee "$RUNNER_TEMP/tun-quality/minimal-rustdoc.log"
+
+      - name: Upload quality gate evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: meow-tun-quality-${{ needs.source.outputs.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/tun-quality/*
+          if-no-files-found: error
+          retention-days: 14
+
+  linux-tests:
+    if: github.event.repository.fork == true
+    name: Linux full-feature source regressions
+    needs: source
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      SOURCE_SHA: ${{ needs.source.outputs.sha }}
+      PINNED_TOOLCHAIN: ${{ needs.source.outputs.toolchain }}
+      MEOW_VERSION_SUFFIX: ''
+    steps:
+      - name: Check out the resolved source SHA
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.source.outputs.sha }}
+          persist-credentials: false
+
+      - name: Verify checkout and install pinned Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$(git rev-parse HEAD)" = "$SOURCE_SHA" ]]
+          [[ -z "$(git status --porcelain --untracked-files=no)" ]]
+          rustup toolchain install "$PINNED_TOOLCHAIN" --profile minimal --no-self-update
+          echo "RUSTUP_TOOLCHAIN=$PINNED_TOOLCHAIN" >> "$GITHUB_ENV"
+
+      - name: Cache Rust test build output
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          key: tun-linux-tests-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
+
+      - name: Install Linux test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake clang libclang-dev pkg-config
+
+      - name: Install LLVM for bindgen
+        uses: KyleMayes/install-llvm-action@v2
+        with:
+          version: ${{ env.LLVM_VERSION }}
+
+      - name: Run full-feature unit, binary, config and API integration tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "source_sha=$SOURCE_SHA"
+            echo "toolchain=$PINNED_TOOLCHAIN"
+            rustc --version --verbose
+            cargo --version
+            cargo tree --locked -p meow-app --no-default-features --features full -e features > "$RUNNER_TEMP/tun-source-feature-graph.txt"
+            grep -F 'listener-tun' "$RUNNER_TEMP/tun-source-feature-graph.txt"
+            set -x
+            cargo test --locked --no-default-features \
+              -p meow-app -p meow-common -p meow-listener -p meow-config -p meow-api \
+              --features meow-app/full,meow-listener/listener-tun,meow-api/listener-tun \
+              --lib --bins --test tun_config_test --test named_tun_config_test --test api_test --test patch_tun_interface_lifecycle \
+              -- --test-threads=1
+          } 2>&1 | tee "$RUNNER_TEMP/tun-source-tests.log"
+
+      - name: Upload source regression evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: meow-tun-source-tests-${{ needs.source.outputs.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/tun-source-tests.log
+            ${{ runner.temp }}/tun-source-feature-graph.txt
+          if-no-files-found: error
+          retention-days: 14
+
+  linux-qa:
+    if: github.event.repository.fork == true
+    name: Linux isolated TUN QA (${{ matrix.flavor }})
+    needs: [source, build, linux-tests, quality-gates]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      SOURCE_SHA: ${{ needs.source.outputs.sha }}
+      SHORT_SHA: ${{ needs.source.outputs.short_sha }}
+      BASE_VERSION: ${{ needs.source.outputs.base_version }}
+      PINNED_TOOLCHAIN: ${{ needs.source.outputs.toolchain }}
+      FLAVOR: ${{ matrix.flavor }}
+    strategy:
+      fail-fast: false
+      matrix:
+        flavor: [test, alpha]
+    steps:
+      - name: Check out the resolved source SHA
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.source.outputs.sha }}
+          persist-credentials: false
+
+      - name: Verify checkout and install namespace test dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$(git rev-parse HEAD)" = "$SOURCE_SHA" ]]
+          [[ -z "$(git status --porcelain --untracked-files=no)" ]]
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends iproute2 tcpdump util-linux python3
+          rustup toolchain install "$PINNED_TOOLCHAIN" --profile minimal --no-self-update
+          echo "RUSTUP_TOOLCHAIN=$PINNED_TOOLCHAIN" >> "$GITHUB_ENV"
+
+      - name: Download the immutable Linux flavor binary
+        uses: actions/download-artifact@v4
+        with:
+          name: meow-tun-${{ matrix.flavor }}-x86_64-unknown-linux-gnu-${{ needs.source.outputs.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/tun-artifact
+
+      - name: Verify source, flavor, toolchain, binary hash and reported version
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/tun-artifact"
+          sha256sum -c meow.sha256
+          read -r binary_sha256 _ < <(sha256sum meow)
+          expected_version="$BASE_VERSION"
+          [[ "$FLAVOR" != alpha ]] || expected_version+="-alpha+$SHORT_SHA"
+          grep -Fxq "source_sha=$SOURCE_SHA" build-info.txt
+          grep -Fxq "source_tree=$(git -C "$GITHUB_WORKSPACE" rev-parse 'HEAD^{tree}')" build-info.txt
+          grep -Fxq "flavor=$FLAVOR" build-info.txt
+          grep -Fxq 'target=x86_64-unknown-linux-gnu' build-info.txt
+          grep -Fxq "toolchain=$PINNED_TOOLCHAIN" build-info.txt
+          grep -Fxq "binary_sha256=$binary_sha256" build-info.txt
+          grep -Fxq "run_id=$GITHUB_RUN_ID" build-info.txt
+          grep -Fxq "run_attempt=$GITHUB_RUN_ATTEMPT" build-info.txt
+          grep -Fxq "version=meow $expected_version" build-info.txt
+          grep -Fq 'listener-tun' feature-graph.txt
+          chmod 755 meow
+          [[ "$(./meow --version)" = "meow $expected_version" ]]
+          cat build-info.txt
+
+      - name: Run FakeIP regression against the same downloaded flavor binary
+        id: fakeip-binary
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$(git rev-parse HEAD)" = "$SOURCE_SHA" ]]
+          [[ -z "$(git status --porcelain --untracked-files=no)" ]]
+          mkdir -p "$RUNNER_TEMP/fakeip-evidence"
+          binary_flavor=stable
+          export MEOW_VERSION_SUFFIX=''
+          if [[ "$FLAVOR" = alpha ]]; then
+            binary_flavor=alpha
+            export MEOW_VERSION_SUFFIX="-alpha+$SHORT_SHA"
+          fi
+          export CARGO_BUILD_TARGET=x86_64-unknown-linux-gnu
+          export MEOW_TEST_BUILD_COMMAND
+          MEOW_TEST_BUILD_COMMAND=$(sed -n 's/^build_command=//p' "$RUNNER_TEMP/tun-artifact/build-info.txt")
+          [[ -n "$MEOW_TEST_BUILD_COMMAND" ]]
+          python3 tests/test_fakeip_filter_binary.py "$RUNNER_TEMP/tun-artifact/meow" \
+            --flavor "$binary_flavor" --output "$RUNNER_TEMP/fakeip-evidence/results.json" \
+            2>&1 | tee "$RUNNER_TEMP/fakeip-evidence/test.log"
+
+      - name: Run isolated practical TUN namespace harness
+        id: tun-harness
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo env \
+            MEOW_BIN="$RUNNER_TEMP/tun-artifact/meow" \
+            MEOW_TUN_SOURCE_SHA="$SOURCE_SHA" \
+            MEOW_TUN_EVIDENCE_DIR=auto \
+            bash tests/test_tun_auto_interface_netns.sh 2>&1 |
+            tee "$RUNNER_TEMP/tun-netns.log"
+          grep -Fxq 'PASS all isolated TUN auto-interface practical regressions' "$RUNNER_TEMP/tun-netns.log"
+          evidence=$(sed -n 's/^EVIDENCE ARTIFACT: //p' "$RUNNER_TEMP/tun-netns.log")
+          [[ "$evidence" =~ ^/tmp/meow-tun-evidence\.[[:alnum:]]{8}$ ]]
+          [[ -d "$evidence" && ! -L "$evidence" ]]
+          read -r binary_sha256 _ < "$RUNNER_TEMP/tun-artifact/meow.sha256"
+          expected_version="$BASE_VERSION"
+          [[ "$FLAVOR" != alpha ]] || expected_version+="-alpha+$SHORT_SHA"
+          sudo grep -Fxq "source_sha=$SOURCE_SHA" "$evidence/binary-identity.txt"
+          sudo grep -Fxq "binary_sha256=$binary_sha256" "$evidence/binary-identity.txt"
+          sudo grep -Fxq "version=meow $expected_version" "$evidence/binary-identity.txt"
+          sudo grep -Fxq 'harness_exit_status=0' "$evidence/run-status.txt"
+
+      - name: Collect TUN diagnostics and binary provenance
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          diagnostics="$RUNNER_TEMP/tun-diagnostics"
+          mkdir -p "$diagnostics"
+          printf 'source_sha=%s\nflavor=%s\n' "$SOURCE_SHA" "$FLAVOR" > "$diagnostics/qa-source.txt"
+          if [[ -f "$RUNNER_TEMP/tun-netns.log" ]]; then
+            cp "$RUNNER_TEMP/tun-netns.log" "$diagnostics/"
+            while IFS= read -r artifact; do
+              [[ "$artifact" =~ ^/tmp/meow-tun-(failure|evidence)\.[[:alnum:]]{8}$ ]] || exit 1
+              [[ -d "$artifact" && ! -L "$artifact" ]] || exit 1
+              sudo cp -a -- "$artifact" "$diagnostics/"
+            done < <(sed -nE 's/^(FAILURE|EVIDENCE) ARTIFACT: //p' "$RUNNER_TEMP/tun-netns.log")
+            sudo chown -R -- "$(id -u):$(id -g)" "$diagnostics"
+          fi
+          if [[ -d "$RUNNER_TEMP/fakeip-evidence" ]]; then
+            cp -a -- "$RUNNER_TEMP/fakeip-evidence" "$diagnostics/"
+          fi
+          for evidence in build-info.txt toolchain.txt feature-graph.txt meow.sha256; do
+            [[ ! -f "$RUNNER_TEMP/tun-artifact/$evidence" ]] || cp "$RUNNER_TEMP/tun-artifact/$evidence" "$diagnostics/"
+          done
+          if [[ -f "$RUNNER_TEMP/tun-artifact/meow" ]]; then
+            (cd "$RUNNER_TEMP/tun-artifact" && sha256sum meow) > "$diagnostics/qa-meow.sha256"
+          fi
+
+      - name: Upload TUN diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: meow-tun-linux-${{ matrix.flavor }}-diagnostics-${{ needs.source.outputs.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/tun-diagnostics/*
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Fail after preserving diagnostics
+        if: steps.tun-harness.outcome == 'failure' || steps.fakeip-binary.outcome == 'failure'
+        run: exit 1

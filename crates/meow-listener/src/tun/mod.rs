@@ -59,6 +59,8 @@
 //! 3. Outbound dials — proxy upstreams *and* DIRECT — go to real IPs, which
 //!    are never inside the fake range, so they take the physical route and
 //!    cannot loop. No SO_MARK, interface binding, or bypass routes needed.
+//!    `auto-detect-interface` still installs the physical binding (and its
+//!    network-change monitor) here when enabled, independently of routes.
 //!
 //! The trade-off: IP-literal traffic (no DNS lookup) is not captured.
 //!
@@ -73,6 +75,7 @@ mod direct_udp;
 mod dns;
 #[cfg(target_os = "windows")]
 mod local_dns;
+mod monitor;
 mod outbound_binding;
 #[cfg(target_os = "linux")]
 mod policy_route;
@@ -128,7 +131,11 @@ const TUN_SNIFF_WINDOW: Duration = crate::stream_sniff::STREAM_SNIFF_WINDOW;
 
 use route::RouteGuard;
 
-pub use outbound_binding::OutboundBinding;
+pub use outbound_binding::{set_outbound_provider_roots, OutboundBinding};
+
+/// Extra provider members whose pooled transports may not be reachable from
+/// the live route graph. The callback takes a fresh snapshot on a change.
+type OutboundRoots = Arc<dyn Fn() -> Vec<Arc<dyn meow_common::Proxy>> + Send + Sync + 'static>;
 
 /// Process-global serialization point for lwIP generations (issue #514).
 /// `NetStack::new` must not run while a previous core is still tearing
@@ -230,9 +237,15 @@ pub struct TunListenerConfig {
     pub auto_route: bool,
     /// Scope of the installed routes (#375).
     pub route_scope: TunRouteScope,
-    /// Physical interface outbound sockets bind to in global scope; `None`
-    /// = auto-detect from the default route. Ignored in fake-IP scope.
+    /// Physical interface outbound sockets bind to; `None` = auto-detect
+    /// from the default route when `auto_detect_interface` is on. Applies in
+    /// global route scope and whenever detection or an explicit interface
+    /// installs the binding outside it.
     pub outbound_interface: Option<String>,
+    /// Select the physical interface per destination and follow changes in
+    /// the default interface, independently of automatic route installation.
+    /// An explicit interface fixes the binding; detection then only monitors.
+    pub auto_detect_interface: bool,
     /// Answer UDP :53 flows with the in-process DNS resolver.
     pub dns_hijack: bool,
     /// Idle timeout for UDP flows (flow-table eviction).
@@ -367,6 +380,9 @@ struct TunDevice {
     /// binding keeps it; otherwise the binding is cleared.
     iface_guard: Option<OutboundBinding>,
     pub(super) device: tun_rs::AsyncDevice,
+    /// Every live TUN remains excluded, even without an outbound binding.
+    /// Field order releases this registration only after closing the device.
+    _registration: route::TunInterfaceRegistration,
 }
 
 pub struct TunListener {
@@ -404,6 +420,7 @@ pub struct TunListener {
     /// flush tasks for its whole life (Codex review). Live-traffic
     /// readers keep following the tunnel slot.
     setup_geometry: Option<FakeIpGeometry>,
+    outbound_roots: Option<OutboundRoots>,
 }
 
 impl TunListener {
@@ -418,6 +435,7 @@ impl TunListener {
             route_override: None,
             tcp_dns_hijack: false,
             setup_geometry: None,
+            outbound_roots: None,
         }
     }
 
@@ -464,6 +482,17 @@ impl TunListener {
     /// route scope.
     pub fn with_outbound_binding(mut self, binding: OutboundBinding) -> Self {
         self.outbound_binding = Some(binding);
+        self
+    }
+
+    /// Include provider members outside the route graph when a physical
+    /// interface change retires transport pools. Callers should capture a
+    /// weak registry handle so the listener does not prolong app state.
+    pub fn with_outbound_roots(
+        mut self,
+        roots: impl Fn() -> Vec<Arc<dyn meow_common::Proxy>> + Send + Sync + 'static,
+    ) -> Self {
+        self.outbound_roots = Some(Arc::new(roots));
         self
     }
 
@@ -706,22 +735,69 @@ impl TunListener {
         let tun_create_ms = t0.elapsed().as_secs_f64() * 1000.0;
         info!("TUN device '{dev_name}' created in {tun_create_ms:.0}ms");
 
-        // Global route scope (#375): before any routes go in, the
-        // outbound-interface binding must be installed so meow's own dials
-        // cannot loop back into the device — usually it already is (the
-        // binary installs it before its first startup dial, a config
-        // reload before the reload's first dial; issue #695).
-        // Fail closed — a global default route without working loop
-        // avoidance would blackhole the host's connectivity.
-        let iface_guard = if cfg.auto_route && cfg.route_scope == TunRouteScope::Global {
+        // Outbound-interface binding (#375, issue #695): installed before
+        // any routes go in whenever this configuration needs it — always in
+        // global route scope, and outside it when `auto-detect-interface` is
+        // enabled or an explicit interface is set. Usually it already is
+        // (the binary installs it before its first startup dial, a config
+        // reload before the reload's first dial). Fail closed — a global
+        // default route without working loop avoidance would blackhole the
+        // host's connectivity.
+        let global_interface = meow_common::global_interface_name();
+        // Match the socket dialer's existing node > global > TUN precedence.
+        let effective_interface = global_interface
+            .as_deref()
+            .or(cfg.outbound_interface.as_deref());
+        let is_global_scope = cfg.auto_route && cfg.route_scope == TunRouteScope::Global;
+        // An explicit interface is always honored; otherwise
+        // `auto-detect-interface` is the switch for the automatic binding.
+        // This matches `meow_config::tun_outbound_binding_policy`, so the
+        // early install and this retry agree on when a binding is due.
+        let is_detection_requested = cfg.auto_detect_interface && effective_interface.is_none();
+        let needs_binding = requires_outbound_binding(
+            cfg.auto_detect_interface,
+            cfg.outbound_interface.is_some(),
+            is_global_scope,
+        );
+        // Detection-only bindings do nothing on platforms without per-socket
+        // interface options, and no TUN route depends on them: keep fake-IP
+        // scope usable there instead of failing a configuration that cannot
+        // loop. Global route scope still fails closed below.
+        let can_bind = cfg!(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "windows"
+        ));
+        let mut iface_guard = if needs_binding && (can_bind || is_global_scope) {
             Some(match preinstalled {
                 Some(binding) => binding,
-                None => OutboundBinding::install(cfg.outbound_interface.as_deref())?,
+                None => OutboundBinding::install_with_auto_detect(
+                    effective_interface,
+                    is_detection_requested,
+                )?,
             })
         } else {
+            if needs_binding {
+                warn!(
+                    "tun '{}': outbound-interface binding is unsupported on this \
+                     platform; no installed TUN route depends on it, so outbound \
+                     sockets stay unbound",
+                    self.name
+                );
+            }
             drop(preinstalled);
             None
         };
+        // Manual-route and detection-off devices must also be excluded by
+        // a successor's early finder during configuration reconstruction.
+        let registration = route::register_tun_interface(&dev_name)?;
+        if let Some(binding) = iface_guard.as_mut() {
+            // Mihomo starts its default-interface monitor for auto-route as
+            // well as auto-detect; monitoring does not change which
+            // interface an explicit binding uses.
+            binding.enable_monitoring(cfg.auto_detect_interface || cfg.auto_route);
+            binding.set_tun_interface(&dev_name)?;
+        }
 
         // The subnet of the address the device took: a retry can step
         // off the configured one (`rotate_v4`). The IPv6 one stays inside
@@ -845,6 +921,7 @@ impl TunListener {
             route_guard,
             iface_guard,
             device,
+            _registration: registration,
         });
 
         // Windows: bind the loopback DNS sockets *before* DnsGuard repoints
@@ -1017,6 +1094,17 @@ impl TunListener {
         } else {
             (udp::UdpIo::Lwip(udp_socket), None)
         };
+        if let Some(monitor) = device
+            .iface_guard
+            .as_ref()
+            .and_then(OutboundBinding::monitor)
+        {
+            tasks.spawn(monitor::run(
+                monitor,
+                self.tunnel.weak_inner(),
+                self.outbound_roots.clone(),
+            ));
+        }
         let (mut pump_in, mut pump_out) = device::spawn_pumps(
             device,
             stack,
@@ -1466,6 +1554,22 @@ fn fake_ip_route_nets(geometry: &FakeIpGeometry, ipv6: bool) -> Vec<ipnet::IpNet
         .collect()
 }
 
+/// Whether the outbound-interface binding is due for this configuration.
+///
+/// A TUN `outbound-interface` always binds (and is the interface used);
+/// otherwise `auto-detect-interface` is the switch. A global
+/// `interface-name` is a per-socket dial policy in its own right, so it
+/// only replaces the detection source here. Global route scope always
+/// needs a binding because meow installs routes that its own sockets would
+/// otherwise follow back into the device.
+fn requires_outbound_binding(
+    auto_detect_interface: bool,
+    has_explicit_tun_interface: bool,
+    is_global_scope: bool,
+) -> bool {
+    auto_detect_interface || has_explicit_tun_interface || is_global_scope
+}
+
 /// The split default routes of global route scope (#375): more specific
 /// than the physical default so it is never touched. IPv6 is included only
 /// when the device carries an IPv6 address — routes into a device that
@@ -1811,6 +1915,21 @@ mod tests {
         );
     }
 
+    /// The binding decision follows `tun_outbound_binding_policy` exactly:
+    /// detection, an explicit interface, and global scope each require it.
+    #[test]
+    fn outbound_binding_is_due_for_detection_explicit_or_global_scope() {
+        use super::requires_outbound_binding;
+
+        assert!(requires_outbound_binding(true, false, false));
+        assert!(requires_outbound_binding(true, true, true));
+        assert!(requires_outbound_binding(false, false, true));
+        assert!(requires_outbound_binding(false, true, true));
+        assert!(requires_outbound_binding(true, true, false));
+        assert!(requires_outbound_binding(false, true, false));
+        assert!(!requires_outbound_binding(false, false, false));
+    }
+
     /// `with_setup_resolver` must snapshot the geometry without keeping
     /// the resolver: a listener that outlives a DNS-only reload would
     /// otherwise pin the retired resolver (caches, FileStore flush tasks)
@@ -1835,6 +1954,7 @@ mod tests {
                 auto_route: true,
                 route_scope: super::TunRouteScope::Global,
                 outbound_interface: None,
+                auto_detect_interface: true,
                 dns_hijack: false,
                 udp_timeout: Duration::from_secs(60),
                 max_connections: 0,

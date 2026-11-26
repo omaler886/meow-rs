@@ -4,20 +4,94 @@ use tokio::sync::broadcast;
 use tracing_subscriber::Layer;
 
 type LogReload = dyn Fn(&str) -> Result<(), String> + Send + Sync;
-static LOG_RELOAD: std::sync::OnceLock<Box<LogReload>> = std::sync::OnceLock::new();
 
+/// Restore the actual logging state captured before a tentative PATCH.
+/// The action must restore the filter and any associated facade max level.
+pub type LogRollbackAction = Box<dyn FnOnce() -> Result<(), String> + Send + 'static>;
+type LogSnapshot = dyn Fn() -> Result<LogRollbackAction, String> + Send + Sync;
+
+struct LogReloader {
+    reload: Box<LogReload>,
+    snapshot: Option<Box<LogSnapshot>>,
+}
+
+static LOG_RELOAD: std::sync::OnceLock<LogReloader> = std::sync::OnceLock::new();
+
+/// Install a legacy reloader for ordinary, single-stage log-level updates.
+/// Multi-stage TUN PATCHes also need a snapshot; embedders can install the
+/// rollback-aware variant below without changing this existing API.
 pub fn install_log_reloader<F>(reload: F)
 where
     F: Fn(&str) -> Result<(), String> + Send + Sync + 'static,
 {
-    let _ = LOG_RELOAD.set(Box::new(reload));
+    let _ = LOG_RELOAD.set(LogReloader {
+        reload: Box::new(reload),
+        snapshot: None,
+    });
+}
+
+/// Install a reloader together with a snapshot of its current actual state.
+/// Snapshotting must not modify logging. A returned action restores that
+/// exact state, including an environment-selected filter, without consulting
+/// the raw configuration document. Installation is atomic and first-wins.
+pub fn install_log_reloader_with_rollback<F, S>(reload: F, snapshot: S)
+where
+    F: Fn(&str) -> Result<(), String> + Send + Sync + 'static,
+    S: Fn() -> Result<LogRollbackAction, String> + Send + Sync + 'static,
+{
+    let _ = LOG_RELOAD.set(LogReloader {
+        reload: Box::new(reload),
+        snapshot: Some(Box::new(snapshot)),
+    });
 }
 
 pub fn reload_log_level(level: &str) -> Result<(), String> {
     match LOG_RELOAD.get() {
-        Some(reload) => reload(level),
+        Some(reloader) => (reloader.reload)(level),
         None => Ok(()),
     }
+}
+
+/// Restore a tentative logging update unless the complete PATCH commits.
+#[must_use = "dropping the token restores the previous actual log filter"]
+pub(crate) struct LogLevelRollback {
+    restore: Option<LogRollbackAction>,
+}
+
+impl LogLevelRollback {
+    /// Keep the new logging state after every fallible PATCH step succeeds.
+    pub(crate) fn commit(mut self) {
+        self.restore = None;
+    }
+}
+
+impl Drop for LogLevelRollback {
+    fn drop(&mut self) {
+        if let Some(restore) = self.restore.take() {
+            if let Err(error) = restore() {
+                tracing::error!(%error, "failed to restore the previous log filter");
+            }
+        }
+    }
+}
+
+/// Apply logging before a fallible TUN transition and retain its exact undo.
+/// A legacy embedder without a snapshot fails before either step changes
+/// state. No installed reloader is a no-op, like reload_log_level itself.
+pub(crate) fn begin_log_level(level: &str) -> Result<LogLevelRollback, String> {
+    let Some(reloader) = LOG_RELOAD.get() else {
+        return Ok(LogLevelRollback { restore: None });
+    };
+    let snapshot = reloader.snapshot.as_ref().ok_or_else(|| {
+        "the installed log reloader has no rollback snapshot for a TUN PATCH".to_owned()
+    })?;
+    let rollback = LogLevelRollback {
+        restore: Some(snapshot()?),
+    };
+    // Construct the token first: even a callback that partially mutates
+    // logging before returning an error is restored by the error path.
+    (reloader.reload)(level)?;
+    Ok(rollback)
 }
 
 /// The `log-level` values meow accepts (mihomo names — `warning`/`silent`

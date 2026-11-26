@@ -65,6 +65,7 @@ pub fn tun_config_to_listener_config(
             meow_config::TunRouteMode::Global => meow_listener::TunRouteScope::Global,
         },
         outbound_interface: tun.outbound_interface.clone(),
+        auto_detect_interface: tun.auto_detect_interface,
         dns_hijack: tun.dns_hijack,
         udp_timeout: tun.udp_timeout,
         max_connections: tun.max_connections,
@@ -83,7 +84,7 @@ pub(crate) type OutboundBinding = meow_listener::OutboundBinding;
 #[cfg(not(feature = "listener-tun"))]
 pub(crate) type OutboundBinding = std::convert::Infallible;
 
-/// A `tun.auto-route: global` outbound-interface binding installed for a
+/// A TUN outbound binding installed for a
 /// configuration *before* its first dial (issue #695), as returned by
 /// [`preinstall_global_route_binding`]. Holding it keeps the binding in
 /// effect; handing it to the TUN listener the configuration spawns keeps it
@@ -104,12 +105,13 @@ impl PreinstalledBinding {
         self.binding.is_some()
     }
 
-    /// Whether installing the binding changed the interface in effect —
-    /// none was bound (`None → Some(Y)`) or another one was
-    /// (`Some(X) → Some(Y ≠ X)`). Sockets and pooled sessions created
-    /// before such a transition are not bound to `Y`: they stay unbound
-    /// (or bound to `X`) for life, and once global routes steer through
-    /// the TUN their traffic can loop into it. `false` when nothing was
+    /// Whether installing the binding changed the effective outbound
+    /// selection — no binding (`None → Some(Y)`), another fallback
+    /// (`Some(X) → Some(Y ≠ X)`), or another strategy for the same name
+    /// (automatic `Y` → fixed `Y` or the reverse). Automatic selection can
+    /// route a destination through an interface other than the fallback, so
+    /// a strategy change strands destination-specific pooled transports even
+    /// when the fallback name is unchanged. `false` when nothing was
     /// installed. Read before installing, so a mutation must evaluate it
     /// under the `CONFIG_MUTATION` lane it installed in.
     pub fn interface_changed(&self) -> bool {
@@ -147,8 +149,9 @@ pub enum PreinstallScope {
     Mutation { named_tun_running: bool },
 }
 
-/// Install the `tun.auto-route: global` outbound-interface binding for `raw`
+/// Install the effective TUN outbound binding selected by `raw` and `scope`
 /// before anything dials on its behalf (issue #695).
+/// Returns an owner guard, or an empty guard when no binding is needed or install fails.
 ///
 /// The binding is per-socket and applied at creation, so a socket opened
 /// before it exists stays unbound for life and loops into the TUN once the
@@ -171,8 +174,7 @@ pub enum PreinstallScope {
 /// listener's teardown does not disturb this one.
 ///
 /// A no-op (default value) unless `raw` and `scope` select an enabled TUN
-/// in global route scope (`auto-route` unset, `true` or `global`) —
-/// TUN-off, fake-IP-scope and `auto-route: false` configs are untouched.
+/// that needs automatic detection, an explicit interface, or a global-route binding.
 /// An install failure is not fatal here: the listener retries before it
 /// touches any route and fails closed with the same error, exactly as
 /// before, and until then no global route exists for a socket to loop on.
@@ -184,26 +186,40 @@ pub fn preinstall_global_route_binding(
     raw: &RawConfig,
     scope: PreinstallScope,
 ) -> PreinstalledBinding {
-    let iface = match scope {
-        PreinstallScope::Startup => meow_config::global_route_outbound_interface(raw.tun.as_ref())
-            .or_else(|| meow_config::named_tun_global_route_interface(raw)),
+    let policy = match scope {
+        PreinstallScope::Startup => meow_config::tun_outbound_binding_policy(raw),
         PreinstallScope::Mutation {
             named_tun_running: false,
-        } => meow_config::global_route_outbound_interface(raw.tun.as_ref()),
+        } if raw.tun.as_ref().is_some_and(|tun| tun.enable) => {
+            meow_config::tun_outbound_binding_policy(raw)
+        }
+        PreinstallScope::Mutation {
+            named_tun_running: false,
+        } => None,
         // A running named TUN owns its binding until restart.
         PreinstallScope::Mutation {
             named_tun_running: true,
         } => None,
     };
-    let Some(iface) = iface else {
+    let Some(policy) = policy else {
         return PreinstalledBinding::default();
     };
-    let previous = meow_common::outbound_interface();
-    match meow_listener::OutboundBinding::install(iface.as_deref()) {
-        Ok(binding) => PreinstalledBinding {
-            interface_changed: previous.as_deref() != Some(binding.interface()),
-            binding: Some(binding),
-        },
+    let previous = meow_common::outbound_interface_snapshot();
+    match meow_listener::OutboundBinding::install_with_auto_detect(
+        policy.interface.as_deref(),
+        policy.auto_detect_interface,
+    ) {
+        Ok(binding) => {
+            // The effective selection strategy matters, not just the fallback
+            // name: automatic `eth0` and fixed `eth0` route differently for
+            // destination-specific traffic, so retained pools must be reset.
+            let strategy_changed = previous.auto_detect != binding.is_auto_detect();
+            PreinstalledBinding {
+                interface_changed: strategy_changed
+                    || previous.interface.as_deref() != Some(binding.interface()),
+                binding: Some(binding),
+            }
+        }
         Err(e) => {
             tracing::debug!(
                 "early outbound-interface binding failed ({e}); the TUN listener retries \

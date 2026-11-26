@@ -594,9 +594,11 @@ pub struct TunConfig {
     /// Which routes `auto-route` installs (#375). Only meaningful when
     /// `auto_route` is true.
     pub route_mode: TunRouteMode,
-    /// Physical interface outbound sockets bind to in global mode; `None`
-    /// = auto-detect from the default route at listener startup.
+    /// Explicit physical interface for this TUN's outbound sockets.
     pub outbound_interface: Option<String>,
+    /// Select the physical interface per destination for outbound sockets.
+    /// Defaults to true for top-level `tun:` and false for named TUNs.
+    pub auto_detect_interface: bool,
     /// True when `dns-hijack` is absent or contains at least one usable
     /// (`:53`) entry; an empty list turns it off.
     pub dns_hijack: bool,
@@ -665,6 +667,7 @@ impl Default for TunConfig {
             auto_route: true,
             route_mode: TunRouteMode::default(),
             outbound_interface: None,
+            auto_detect_interface: true,
             dns_hijack: true,
             udp_timeout: std::time::Duration::from_secs(60),
             max_connections: 256,
@@ -756,7 +759,6 @@ pub fn parse_tun_config(
     // never silently ignore a mihomo flag).
     for (name, val) in [
         ("strict-route", &r.strict_route),
-        ("auto-detect-interface", &r.auto_detect_interface),
         ("auto-redirect", &r.auto_redirect),
         ("endpoint-independent-nat", &r.endpoint_independent_nat),
         ("mtu-v6", &r.mtu_v6),
@@ -825,18 +827,6 @@ pub fn parse_tun_config(
     let global = auto_route && route_mode == TunRouteMode::Global;
 
     let outbound_interface = raw_outbound_interface(r);
-    if outbound_interface.is_some() && !global {
-        warn!(
-            "tun.outbound-interface: only used when auto-route captures all traffic \
-             ('auto-route: true'); ignored"
-        );
-    }
-    // Normalise the ignored value out: the commit path diffs parsed
-    // `TunConfig`s to decide on a restart, and a field that does nothing
-    // must not trigger one — a PUT touching only `outbound-interface`
-    // under fake-ip scope would otherwise bounce a healthy listener
-    // (issue #543 review).
-    let outbound_interface = outbound_interface.filter(|_| global);
 
     // `inet6-address` is validated in every mode, but only global mode has
     // IPv6 routes to send into the device — elsewhere an address on the
@@ -860,6 +850,7 @@ pub fn parse_tun_config(
         auto_route,
         route_mode,
         outbound_interface,
+        auto_detect_interface: r.auto_detect_interface.unwrap_or(true),
         dns_hijack,
         udp_timeout,
         max_connections: global_max_connections.unwrap_or(defaults.max_connections),
@@ -924,15 +915,7 @@ pub fn parse_named_tun_config(
 ) -> Result<TunConfig, anyhow::Error> {
     let name = &raw_l.name;
     // Warn on the upstream keys meow does not implement (Class B per
-    // ADR-0002) — `auto-detect-interface` gets its specific reason: it
-    // never controlled the outbound-interface binding meow installs for
-    // loop protection under global route scope.
-    if raw_l.auto_detect_interface.is_some() {
-        warn!(
-            "listeners[{name}].auto-detect-interface: meow's loop-protection \
-             outbound-interface binding is not governed by this flag — ignored"
-        );
-    }
+    // ADR-0002).
     for (key, val) in [
         ("dns-mode", &raw_l.dns_mode),
         ("strict-route", &raw_l.strict_route),
@@ -984,13 +967,6 @@ pub fn parse_named_tun_config(
     let global = auto_route && route_mode == TunRouteMode::Global;
 
     let outbound_interface = raw_l.outbound_interface.clone().filter(|s| !s.is_empty());
-    if outbound_interface.is_some() && !global {
-        warn!(
-            "listeners[{name}].outbound-interface: only used when auto-route \
-             captures all traffic ('auto-route: true' or 'global'); ignored"
-        );
-    }
-    let outbound_interface = outbound_interface.filter(|_| global);
 
     // Absent: on. An empty list turns it off. Only the exact wildcard
     // :53 forms enable the UDP hijack — a `tcp:` target (the pump has no
@@ -1041,6 +1017,7 @@ pub fn parse_named_tun_config(
         auto_route,
         route_mode,
         outbound_interface,
+        auto_detect_interface: raw_l.auto_detect_interface.unwrap_or(false),
         dns_hijack,
         udp_timeout,
         max_connections: raw_l.max_connections.unwrap_or(global_max_connections),
@@ -1253,6 +1230,70 @@ pub fn global_route_outbound_interface(raw: Option<&raw::RawTun>) -> Option<Opti
         Ok((true, TunRouteMode::Global)) => Some(raw_outbound_interface(r)),
         _ => None,
     }
+}
+
+/// Return the effective startup/reload TUN binding policy for the document `raw`.
+/// The enabled top-level TUN takes priority over the sole named TUN; explicit
+/// `outbound-interface` and global `interface-name` override detection.
+/// Detection is independent of auto-route scope, while global route mode
+/// still requires a binding even when detection is explicitly disabled.
+/// Returns `None` when no effective TUN needs an outbound binding.
+pub fn tun_outbound_binding_policy(raw: &raw::RawConfig) -> Option<TunOutboundBindingPolicy> {
+    let global_interface = raw
+        .interface_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned);
+
+    if let Some(tun) = raw.tun.as_ref().filter(|tun| tun.enable) {
+        let (auto_route, route_mode) = parse_auto_route(tun).ok()?;
+        let outbound_interface = raw_outbound_interface(tun);
+        let has_explicit_tun_interface = outbound_interface.is_some();
+        // Preserve socket dialer precedence: node > global > TUN override > detection.
+        let interface = global_interface.or(outbound_interface);
+        let detection_requested = tun.auto_detect_interface.unwrap_or(true);
+        let auto_detect_interface = detection_requested && interface.is_none();
+        return (has_explicit_tun_interface
+            || detection_requested
+            || (auto_route && route_mode == TunRouteMode::Global))
+            .then_some(TunOutboundBindingPolicy {
+                interface,
+                auto_detect_interface,
+            });
+    }
+
+    let listener = raw
+        .listeners
+        .as_deref()?
+        .iter()
+        .find(|listener| listener.listener_type.eq_ignore_ascii_case("tun"))?;
+    let (auto_route, route_mode) =
+        parse_auto_route_value(listener.auto_route.as_ref(), false, "").ok()?;
+    let outbound_interface = listener
+        .outbound_interface
+        .clone()
+        .filter(|name| !name.is_empty());
+    let has_explicit_tun_interface = outbound_interface.is_some();
+    // Preserve socket dialer precedence: node > global > TUN override > detection.
+    let interface = global_interface.or(outbound_interface);
+    let detection_requested = listener.auto_detect_interface.unwrap_or(false);
+    let auto_detect_interface = detection_requested && interface.is_none();
+    (has_explicit_tun_interface
+        || detection_requested
+        || (auto_route && route_mode == TunRouteMode::Global))
+        .then_some(TunOutboundBindingPolicy {
+            interface,
+            auto_detect_interface,
+        })
+}
+
+/// The effective interface and detection mode used to install TUN outbound
+/// binding before startup/reload dials.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TunOutboundBindingPolicy {
+    pub interface: Option<String>,
+    pub auto_detect_interface: bool,
 }
 
 pub struct ListenerConfig {

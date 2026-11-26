@@ -1361,9 +1361,7 @@ async fn get_configs(State(state): State<Arc<AppState>>) -> Json<ConfigResponse>
 /// In a patch every key is optional and `null` counts as absent: the keys
 /// it carries are merged over the committed section and the rest keep
 /// their value, `enable` included (mihomo reads an omitted `enable` as
-/// `false`). Any other key is ignored, mihomo's upstream-only ones
-/// (`strict-route`, `auto-detect-interface`, `auto-redirect`, …)
-/// included.
+/// `false`). Unsupported keys are ignored.
 #[derive(Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 struct TunFields {
@@ -1381,6 +1379,8 @@ struct TunFields {
     auto_route: Option<RawAutoRoute>,
     #[serde(skip_serializing_if = "Option::is_none")]
     outbound_interface: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auto_detect_interface: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     dns_hijack: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1406,6 +1406,7 @@ impl TunFields {
             inet6_address: tun.inet6_address,
             auto_route: tun.auto_route,
             outbound_interface: tun.outbound_interface,
+            auto_detect_interface: Some(tun.auto_detect_interface.unwrap_or(true)),
             dns_hijack: tun.dns_hijack,
             udp_timeout: tun.udp_timeout,
             stack: tun.stack,
@@ -1428,6 +1429,7 @@ impl TunFields {
         merge(&mut tun.inet6_address, self.inet6_address);
         merge(&mut tun.auto_route, self.auto_route);
         merge(&mut tun.outbound_interface, self.outbound_interface);
+        merge(&mut tun.auto_detect_interface, self.auto_detect_interface);
         merge(&mut tun.dns_hijack, self.dns_hijack);
         merge(&mut tun.udp_timeout, self.udp_timeout);
         merge(&mut tun.stack, self.stack);
@@ -1643,38 +1645,59 @@ async fn update_configs(
             (raw.tun.as_ref() != Some(&tun)).then_some(tun)
         }
     };
-    // The remaining writes share one commit shape — packaged so the TUN
-    // arm can carry the identical tail inside the owned task.
+    // The effective interface participates in TUN ownership, even when
+    // PATCH contains no tun object. Compare the complete candidate before
+    // stripping this field from the ordinary tail; otherwise clearing the
+    // global override restores the old fixed owner instead of detection.
+    let interface_name = body.interface_name.take();
+    let prior = state.raw_config.read().clone();
+    let mut candidate = prior.clone();
+    let has_tun_patch = tun.is_some();
+    if let Some(tun) = tun {
+        candidate.tun = Some(tun);
+    }
+    if let Some(name) = interface_name.as_ref() {
+        candidate.interface_name = Some(name.clone());
+    }
+    let interface_reconcile = candidate.tun.as_ref().is_some_and(|tun| tun.enable)
+        && meow_config::tun_outbound_binding_policy(&prior)
+            != meow_config::tun_outbound_binding_policy(&candidate);
+    let needs_reconcile = has_tun_patch || interface_reconcile;
+    if interface_reconcile {
+        // An interface-only restart must pass the same spawn-side gates as
+        // a tun-object patch before stopping a healthy running listener.
+        if let Err(error) = meow_config::parse_tun_config(
+            candidate.tun.as_ref(),
+            candidate.max_connections,
+            candidate.fake_ip_range(),
+        ) {
+            return msg_err(
+                StatusCode::BAD_REQUEST,
+                &format!("tun config error: {error}"),
+            );
+        }
+        if let Err(error) = meow_config::sniffer_config_from_raw(&candidate) {
+            return msg_err(
+                StatusCode::BAD_REQUEST,
+                &format!("sniffer config error: {error}"),
+            );
+        }
+    }
     let tail = PatchTail {
         mode: mode.and_then(Result::ok),
         log_level: body.log_level.take(),
         routing_mark: body.routing_mark,
-        interface_name: body.interface_name.take(),
+        interface_name: if needs_reconcile {
+            None
+        } else {
+            interface_name
+        },
         global_ua: body.global_ua.take(),
         tcp_concurrent: body.tcp_concurrent,
         find_process_mode: body.find_process_mode,
         keepalive,
     };
-    // Apply the fallible sides first — committing mode before a failed
-    // step would partially apply the PATCH (issue #514). TUN goes first:
-    // it is the step that fails in practice (a device the process may not
-    // create), so such a PATCH leaves mode and log level as they were. The
-    // TUN change runs the reload path's reconcile, rollback included —
-    // the whole arm rides `run_owned_mutation` so a cancelled request
-    // cannot interrupt stop → spawn → commit → tail-write partway.
-    if let Some(tun) = tun {
-        let prior = state.raw_config.read().clone();
-        let mut candidate = prior.clone();
-        candidate.tun = Some(tun);
-        // The tail fields deliberately do NOT ride the candidate: the
-        // swap's commit would publish them (and the keepalive posture it
-        // resolves from `final_doc`) BEFORE `finish_patch_writes` runs
-        // the fallible log-level reload — a reloader error would answer
-        // 500 over an already-committed PATCH. With `candidate` carrying
-        // only the `tun:` change, the swap's process-global installs all
-        // re-assert the committed values (no-ops) and every tail knob
-        // still lands in `finish_patch_writes`, after every fallible
-        // step — the same ordering the non-TUN path below already uses.
+    if needs_reconcile {
         let preinstalled = preinstall_global_route_binding(
             &candidate,
             PreinstallScope::Mutation {
@@ -1684,13 +1707,19 @@ async fn update_configs(
                 ),
             },
         );
-        // No routing publish runs here, so tracked TCP predating a
-        // pre-installed global-route binding is still live. The rollback
-        // document is the pre-patch one: a failed spawn commits it with
-        // `tun.enable` rolled back, and the tail fields were never
-        // merged into the candidate — a rejected PATCH publishes none of
-        // them (issue #974).
+        // The request cannot abandon the log rollback token or the device
+        // transition: the owned task retains the mutation lane throughout.
         let (lane, response) = run_owned_mutation(&state, mutation, |state| async move {
+            let log_change = match tail.log_level.as_deref() {
+                Some(level) => match crate::log_stream::begin_log_level(level) {
+                    Ok(change) => Some(change),
+                    Err(error) => return msg_err(StatusCode::INTERNAL_SERVER_ERROR, &error),
+                },
+                None => None,
+            };
+            // Only tun and interface-name ride this candidate. On a TUN
+            // failure the prior document restores interface-name and all
+            // tail fields, while keeping the existing tun.enable rollback.
             let receipt = swap_config_and_reconcile_tun(
                 &state,
                 candidate,
@@ -1708,7 +1737,12 @@ async fn update_configs(
                 )
                     .into_response();
             }
-            finish_patch_writes(&state, tail)
+            if let Some(change) = log_change {
+                change.commit();
+            }
+            // The fallible logger already ran exactly once; this tail is
+            // now infallible and must not invoke the reloader again.
+            finish_patch_writes_after_log_reload(&state, tail)
         })
         .await;
         let _mutation = lane;
@@ -1745,6 +1779,11 @@ fn finish_patch_writes(state: &AppState, tail: PatchTail) -> Response {
                 .into_response();
         }
     }
+    finish_patch_writes_after_log_reload(state, tail)
+}
+
+/// Commit the PATCH tail after its one fallible logging update succeeded.
+fn finish_patch_writes_after_log_reload(state: &AppState, tail: PatchTail) -> Response {
     let mut raw = state.raw_config.write();
     if let Some(parsed_mode) = tail.mode {
         state.tunnel.set_mode(parsed_mode);
@@ -2561,6 +2600,8 @@ fn tun_reconcile_differs(old: &RawConfig, candidate: &RawConfig) -> bool {
         && old.sniffer == candidate.sniffer
         && old.tproxy_sni == candidate.tproxy_sni
         && old.fake_ip_range() == candidate.fake_ip_range()
+        && meow_config::tun_outbound_binding_policy(old)
+            == meow_config::tun_outbound_binding_policy(candidate)
     {
         // Fast path: identical raw sections cannot differ semantically —
         // and skipping the parse avoids re-warn!ing on every commit that
@@ -2578,6 +2619,8 @@ fn tun_reconcile_differs(old: &RawConfig, candidate: &RawConfig) -> bool {
     ) {
         (Ok(o), Ok(n)) => {
             o != n
+                || meow_config::tun_outbound_binding_policy(old)
+                    != meow_config::tun_outbound_binding_policy(candidate)
                 || match (
                     meow_config::sniffer_config_from_raw(old),
                     meow_config::sniffer_config_from_raw(candidate),
@@ -4585,8 +4628,9 @@ async fn swap_config_and_reconcile_tun(
         // …) restarts a running listener while no-op respellings
         // (`auto-route: true` vs `fake-ip`, explicit defaults, `stack`
         // spellings that parse to the same `TunStack`) and warn-only
-        // ignored fields (`strict-route`, `auto-detect-interface`, …)
-        // do not. Shared with the forced-commit fallbacks above as
+        // ignored fields (`strict-route`, …) do not. Effective outbound
+        // binding policy is compared too, so global interface-name reloads
+        // retarget the listener. Shared with forced-commit fallbacks as
         // [`tun_reconcile_differs`].
         let tun_changed = tun_reconcile_differs(&guard, &candidate);
         // Extract health-check specs straight from the candidate — no
@@ -5106,9 +5150,10 @@ pub fn tun_failed(message: String) {
 /// the mutation pre-installed ([`preinstall_global_route_binding`]) — the
 /// binding is now the configuration's, for as long as the listener runs.
 ///
-/// When the binding changed the interface in effect (`interface_changed`:
-/// the `None → Some(Y)` / `Some(X) → Some(Y ≠ X)` transition read under the
-/// lane before the install), sessions opened before it — UDP NAT and
+/// When the binding changed the effective selection (`interface_changed`:
+/// the `None → Some(Y)`, `Some(X) → Some(Y ≠ X)`, or same-name
+/// automatic ↔ fixed strategy transition read under the lane before the
+/// install), sessions opened before it — UDP NAT and
 /// listener flows, DNS upstream pools, pooled QUIC/mux/smux sessions of
 /// adapters retained across the reload, tracked TCP unless `tracked_tcp`
 /// says the routing publish already cancelled it — are not bound to `Y` and
@@ -7273,6 +7318,36 @@ mod tests {
         assert!(!dns_inputs_equal(&raw_a, &raw_ab));
     }
 
+    /// Verify effective API projection, patch merging and restart decisions from YAML.
+    #[test]
+    fn tun_auto_detect_projection_and_reconcile_are_effective() {
+        let parse = |yaml: &str| meow_config::parse_raw_yaml(yaml).unwrap();
+        let omitted = parse("tun:\n  enable: true\n");
+        let enabled = parse("tun:\n  enable: true\n  auto-detect-interface: true\n");
+        let disabled = parse("tun:\n  enable: true\n  auto-detect-interface: false\n");
+        assert_eq!(
+            TunFields::reported(omitted.tun.as_ref(), true).auto_detect_interface,
+            Some(true)
+        );
+        assert!(!tun_reconcile_differs(&omitted, &enabled));
+        assert!(tun_reconcile_differs(&omitted, &disabled));
+        assert!(tun_transition_pending(&omitted, &disabled));
+        let retargeted = parse("interface-name: eth9\ntun:\n  enable: true\n");
+        assert!(tun_reconcile_differs(&omitted, &retargeted));
+
+        let mut patched = omitted.tun.clone().unwrap();
+        TunFields {
+            auto_detect_interface: Some(false),
+            ..TunFields::default()
+        }
+        .merge_into(&mut patched);
+        assert_eq!(patched.auto_detect_interface, Some(false));
+        assert_eq!(
+            TunFields::reported(Some(&patched), true).auto_detect_interface,
+            Some(false)
+        );
+    }
+
     /// Issue #533 review: `swap_config_and_reconcile_tun` compares the TUN
     /// listener's fake-IP inputs against the resolver generation being
     /// REPLACED — captured before the caller's early `set_resolver`. Reading
@@ -8195,12 +8270,12 @@ mod global_route_binding_tests {
     async fn mutations_preinstall_and_restore_the_binding() {
         assert_eq!(iface(), None);
 
-        // ── The helper: only an enabled global-scope TUN installs. ──
+        // ── TUN detection or global route scope installs. ──
         for yaml in [
             "port: 7890\n",
             "tun:\n  enable: false\n  auto-route: global\n  outbound-interface: lo\n",
-            "tun:\n  enable: true\n  auto-route: fake-ip\n  outbound-interface: lo\n",
-            "tun:\n  enable: true\n  auto-route: false\n",
+            "tun:\n  enable: true\n  auto-route: fake-ip\n  auto-detect-interface: false\n",
+            "tun:\n  enable: true\n  auto-route: false\n  auto-detect-interface: false\n",
             "tun:\n  enable: true\n  auto-route: bogus\n  outbound-interface: lo\n",
             // A missing interface: not fatal here, nothing installed.
             "tun:\n  enable: true\n  auto-route: global\n  outbound-interface: no-such-iface-zz9\n",
@@ -8210,17 +8285,41 @@ mod global_route_binding_tests {
             assert_eq!(iface(), None, "{yaml}");
         }
         // None → Some(lo) is a change; a second owner of the same
-        // interface is not; a non-global candidate leaves it alone.
+        // interface is not; a candidate with no binding policy leaves it alone.
         let first = preinstall_global_route_binding(&raw(GLOBAL_LO), MUT);
         assert!(first.is_installed() && first.interface_changed());
         assert_eq!(iface().as_deref(), Some("lo"));
         let second = preinstall_global_route_binding(&raw(GLOBAL_LO), MUT);
         assert!(second.is_installed() && !second.interface_changed());
         let fake_ip = preinstall_global_route_binding(
-            &raw("tun:\n  enable: true\n  auto-route: fake-ip\n"),
+            &raw("tun:\n  enable: true\n  auto-route: fake-ip\n  auto-detect-interface: false\n"),
             MUT,
         );
         assert!(!fake_ip.is_installed() && !fake_ip.interface_changed());
+        let explicit_fake_ip = preinstall_global_route_binding(
+            &raw("tun:\n  enable: true\n  auto-route: fake-ip\n  auto-detect-interface: true\n  outbound-interface: lo\n"),
+            MUT,
+        );
+        assert!(explicit_fake_ip.is_installed());
+        assert_eq!(iface().as_deref(), Some("lo"));
+        drop(explicit_fake_ip);
+        assert_eq!(
+            iface().as_deref(),
+            Some("lo"),
+            "previous owners remain bound"
+        );
+        let explicit_no_route = preinstall_global_route_binding(
+            &raw("tun:\n  enable: true\n  auto-route: false\n  auto-detect-interface: false\n  outbound-interface: lo\n"),
+            MUT,
+        );
+        assert!(explicit_no_route.is_installed());
+        drop(explicit_no_route);
+        assert_eq!(iface().as_deref(), Some("lo"));
+        let fail_closed = preinstall_global_route_binding(
+            &raw("tun:\n  enable: true\n  auto-route: global\n  auto-detect-interface: false\n"),
+            MUT,
+        );
+        assert!(!fail_closed.is_installed());
         drop(second);
         assert_eq!(iface().as_deref(), Some("lo"), "first owner restored");
         drop(first);
@@ -8280,8 +8379,11 @@ mod global_route_binding_tests {
         drop(running);
         assert_eq!(iface(), None, "the rejected PUT's owner must be released");
 
-        // ── Non-global candidates never install (no behaviour change).
-        for tun in ["", "tun:\n  enable: true\n  auto-route: fake-ip\n"] {
+        // ── Candidates without effective binding policy never install.
+        for tun in [
+            "",
+            "tun:\n  enable: true\n  auto-route: fake-ip\n  auto-detect-interface: false\n",
+        ] {
             let (status, body) = put(&state, &candidate(tun, &origin, BAD_LISTENERS)).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
             assert_eq!(origin.take_seen(), vec![None], "{tun}");
@@ -8311,8 +8413,9 @@ mod global_route_binding_tests {
                 udp_flows: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             })
             .await;
-        let restart =
-            format!("{GLOBAL_LO}  mtu: 9000\n  device: meow-name-too-long-for-ifnamsiz\n");
+        let restart = format!(
+            "{GLOBAL_LO}  auto-detect-interface: false\n  device: meow-name-too-long-for-ifnamsiz\n"
+        );
         let (status, body) = put(&state, &candidate(&restart, &origin, "")).await;
         assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
         assert_eq!(origin.take_seen(), vec![Some("lo".to_string())]);
@@ -8329,6 +8432,17 @@ mod global_route_binding_tests {
                 .as_ref()
                 .is_some_and(|t| !t.enable),
             "the failed spawn rolls `enable` back"
+        );
+        assert_eq!(
+            state
+                .raw_config
+                .read()
+                .tun
+                .as_ref()
+                .unwrap()
+                .auto_detect_interface,
+            Some(false),
+            "auto-detection change commits while listener enable rolls back"
         );
         assert!(!state.tunnel.has_tun());
         assert_eq!(iface(), None, "nothing runs, so nothing stays bound");
@@ -8370,6 +8484,50 @@ mod global_route_binding_tests {
         assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
         assert_eq!(origin.take_seen(), vec![None]);
         assert_eq!(iface(), None);
+
+        // ── Same fallback name, different selection strategy: automatic →
+        // fixed. Automatic selection may have routed a destination through a
+        // non-fallback interface, so retained DNS/provider/mux/QUIC/UDP pools
+        // must still be retired even though the fallback name is unchanged.
+        if let Ok(automatic) = meow_listener::OutboundBinding::install_with_auto_detect(None, true)
+        {
+            let fallback = automatic.interface().to_owned();
+            let fixed_yaml = format!(
+                "tun:\n  enable: true\n  auto-route: global\n  \
+                 auto-detect-interface: false\n  outbound-interface: {fallback}\n"
+            );
+            state.tunnel.inner().nat_table.insert(
+                (
+                    "127.0.0.1:40001".parse().unwrap(),
+                    "203.0.113.11:443".parse().unwrap(),
+                ),
+                Arc::new(meow_tunnel::udp::UdpSession::new(
+                    meow_proxy::RejectAdapter::new(false)
+                        .dial_udp(&meow_common::Metadata::default())
+                        .await
+                        .unwrap(),
+                    Arc::from("DIRECT"),
+                )),
+            );
+            let listener_flow = state.tunnel.inner().udp_flush_watch();
+            let fixed = preinstall_global_route_binding(&raw(&fixed_yaml), MUT);
+            assert!(fixed.is_installed());
+            assert!(
+                fixed.interface_changed(),
+                "automatic → fixed is a selection-strategy change even with the same fallback"
+            );
+            let flush =
+                outbound_binding_adopted(&state, fixed.interface_changed(), TrackedTcp::Cancel)
+                    .expect("a strategy change flushes retained transports");
+            assert!(flush.udp > 0, "pooled UDP sessions are retired");
+            assert!(flush.adapters > 0, "pooled adapter sessions are reset");
+            assert!(state.tunnel.inner().nat_table.is_empty());
+            assert!(listener_flow.is_flushed());
+            drop(fixed);
+            assert_eq!(iface().as_deref(), Some(fallback.as_str()));
+            drop(automatic);
+            assert_eq!(iface(), None);
+        }
     }
 }
 

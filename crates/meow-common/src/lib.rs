@@ -84,7 +84,11 @@ pub use outbound_iface::apply_outbound_interface;
     any(target_os = "linux", target_os = "macos", target_os = "windows")
 ))]
 pub use outbound_iface::apply_outbound_interface_for_peer;
-pub use outbound_iface::{install_outbound_interface, outbound_interface, OutboundIfaceGuard};
+pub use outbound_iface::{
+    install_outbound_interface, install_outbound_interface_with_finder, outbound_interface,
+    outbound_interface_auto_detect, outbound_interface_snapshot, OutboundIfaceGuard,
+    OutboundInterfaceFinder, OutboundInterfaceSnapshot, OutboundNetworkAcknowledgement,
+};
 pub use process_lookup::{
     disable_socket_table_cache, find_process, find_process_async, FlowLookup, ProcessInfo,
     ProcessLookupMode, ProcessLookupPolicy,
