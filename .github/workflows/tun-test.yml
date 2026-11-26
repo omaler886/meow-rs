@@ -119,7 +119,10 @@ jobs:
         shell: bash
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends cmake clang libclang-dev pkg-config
+          sudo apt-get install -y --no-install-recommends cmake clang-18 libclang-18-dev pkg-config
+          test -f /usr/lib/llvm-18/lib/libclang.so
+          echo 'LIBCLANG_PATH=/usr/lib/llvm-18/lib' >> "$GITHUB_ENV"
+          clang-18 --version
 
       - name: Install macOS native dependencies
         if: runner.os == 'macOS'
@@ -129,6 +132,7 @@ jobs:
 
       # lwIP and boring-sys both use bindgen; match the Windows TUN CI pin.
       - name: Install LLVM for bindgen
+        if: runner.os != 'Linux'
         uses: KyleMayes/install-llvm-action@v2
         with:
           version: ${{ env.LLVM_VERSION }}
@@ -252,12 +256,10 @@ jobs:
       - name: Install native quality dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends cmake clang libclang-dev pkg-config
-
-      - name: Install LLVM for quality bindgen
-        uses: KyleMayes/install-llvm-action@v2
-        with:
-          version: ${{ env.LLVM_VERSION }}
+          sudo apt-get install -y --no-install-recommends cmake clang-18 libclang-18-dev pkg-config
+          test -f /usr/lib/llvm-18/lib/libclang.so
+          echo 'LIBCLANG_PATH=/usr/lib/llvm-18/lib' >> "$GITHUB_ENV"
+          clang-18 --version
 
       - name: Formatting and strict Clippy feature matrix
         shell: bash
@@ -344,9 +346,13 @@ jobs:
       - name: Install Linux test dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends cmake clang libclang-dev pkg-config
+          sudo apt-get install -y --no-install-recommends cmake clang-18 libclang-18-dev pkg-config
+          test -f /usr/lib/llvm-18/lib/libclang.so
+          echo 'LIBCLANG_PATH=/usr/lib/llvm-18/lib' >> "$GITHUB_ENV"
+          clang-18 --version
 
       - name: Install LLVM for bindgen
+        if: runner.os != 'Linux'
         uses: KyleMayes/install-llvm-action@v2
         with:
           version: ${{ env.LLVM_VERSION }}

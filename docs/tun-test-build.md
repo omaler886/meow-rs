@@ -49,8 +49,10 @@ cargo build --release --locked -p meow-app --no-default-features --features full
 ```
 
 Linux installs the native C/C++/CMake/bindgen dependencies. macOS uses the
-runner's Xcode toolchain plus CMake. All three runners install pinned LLVM
-`18.1.8` for bindgen. Windows fetches the pinned official Wintun DLL before
+runner's Xcode toolchain plus CMake. Windows and macOS install LLVM `18.1.8` for bindgen. Ubuntu 24.04 uses
+its packaged `clang-18`/`libclang-18-dev`, with `LIBCLANG_PATH` set to the
+distribution library directory; the standalone LLVM 18 Linux archive depends
+on the removed `libtinfo.so.5` and is not used. Windows fetches the pinned official Wintun DLL before
 compilation and passes it through `MEOW_WINTUN_DLL`, so it is embedded in
 each executable. These are full TUN builds; the size-capped `minimal` bundle
 is not a test flavor.
