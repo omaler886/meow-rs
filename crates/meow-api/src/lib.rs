@@ -193,13 +193,9 @@ pub fn preinstall_global_route_binding(
         } if raw.tun.as_ref().is_some_and(|tun| tun.enable) => {
             meow_config::tun_outbound_binding_policy(raw)
         }
-        PreinstallScope::Mutation {
-            named_tun_running: false,
-        } => None,
-        // A running named TUN owns its binding until restart.
-        PreinstallScope::Mutation {
-            named_tun_running: true,
-        } => None,
+        // A running named TUN owns its binding until restart. Mutations
+        // without an enabled top-level TUN also leave the owner untouched.
+        PreinstallScope::Mutation { .. } => None,
     };
     let Some(policy) = policy else {
         return PreinstalledBinding::default();

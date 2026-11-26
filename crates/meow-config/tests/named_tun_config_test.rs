@@ -355,7 +355,7 @@ async fn nt11b_auto_detect_interface_defaults_off_and_is_typed() {
     for value in ["yes", "1", "null"] {
         let yaml = tun_yaml(&format!("    auto-detect-interface: {value}\n"));
         assert!(
-            serde_saphyr::from_str::<meow_config::raw::RawConfig>(&yaml).is_err(),
+            meow_config::parse_raw_yaml(&yaml).is_err(),
             "invalid boolean must fail: {value}"
         );
     }

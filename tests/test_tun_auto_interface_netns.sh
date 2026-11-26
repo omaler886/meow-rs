@@ -352,6 +352,23 @@ converge_transition() {
     snapshot_network "$phase"
 }
 
+# Match the unbound echo clients after a TUN restart; verify both protocol/family capture routes.
+assert_tun_capture_routes() {
+    local phase=$1 family address protocol route
+    for protocol in tcp udp; do
+        for family in 4 6; do
+            address=203.0.113.9
+            [[ "$family" = 4 ]] || address=fd00:99::9
+            route=$(ip -"$family" route get "$address" ipproto "$protocol" dport 18080) || \
+                fail "$phase $protocol IPv$family has no capture route"
+            printf '%s %s IPv%s: %s\n' "$phase" "$protocol" "$family" "$route" >> "$WORK/$phase-capture-routes.txt"
+            grep -q 'dev meowtest' <<< "$route" || \
+                fail "$phase unbound $protocol IPv$family bypassed the TUN"
+        done
+    done
+    echo "PASS $phase unbound TCP/UDP IPv4/IPv6 routes enter meowtest"
+}
+
 # Allocate once before reload; all later phases dial that saved fake address without re-querying it.
 probe_fakeip() {
     local phase=$1 source=$2
@@ -558,12 +575,14 @@ grep -q "bound to 'uplink1'.*auto-detect-interface: false" "$WORK/manual.log" ||
     fail 'explicit interface did not disable the automatic finder'
 # Clearing a top-level override must permanently adopt the TUN-specific fallback.
 timeout 8 python3 "$SERVICES" api-patch 127.0.0.1 19090 global-cleared '{"interface-name":""}'
+assert_tun_capture_routes patch-global-cleared
 probe_matrix patch-global-cleared 0
 grep -q "bound to 'uplink0'.*auto-detect-interface: false" "$WORK/manual.log" || \
     fail 'PATCH did not adopt the TUN-specific fallback'
 # Clearing that fallback in the same PATCH restores destination-aware detection.
 timeout 8 python3 "$SERVICES" api-patch 127.0.0.1 19090 automatic-restored \
     '{"interface-name":"","tun":{"outbound-interface":""}}'
+assert_tun_capture_routes patch-automatic-restored
 probe_matrix patch-automatic-restored 0
 grep -q "bound to 'uplink0'.*auto-detect-interface: true" "$WORK/manual.log" || \
     fail 'PATCH did not restore automatic interface selection'
@@ -573,6 +592,7 @@ timeout --kill-after=1 5 python3 -u "$SERVICES" converge patch-auto-uplink1 \
     --daemon-log "$WORK/manual.log" --receipts "$WORK/server.log" --before "$retirements_before" \
     --source-v4 10.71.0.2 --source-v6 fd00:71::2 --timeout 4.8 || \
     fail 'PATCH-restored automatic binding did not follow a new default'
+assert_tun_capture_routes patch-auto-uplink1
 snapshot_network patch-auto-uplink1
 echo 'PASS live PATCH adopts fixed fallback, restores automatic detection and follows new default'
 set_default 0

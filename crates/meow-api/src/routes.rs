@@ -7335,7 +7335,7 @@ mod tests {
         let retargeted = parse("interface-name: eth9\ntun:\n  enable: true\n");
         assert!(tun_reconcile_differs(&omitted, &retargeted));
 
-        let mut patched = omitted.tun.clone().unwrap();
+        let mut patched = omitted.tun.unwrap();
         TunFields {
             auto_detect_interface: Some(false),
             ..TunFields::default()

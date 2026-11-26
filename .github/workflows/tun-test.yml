@@ -390,7 +390,7 @@ jobs:
   linux-qa:
     if: github.event.repository.fork == true
     name: Linux isolated TUN QA (${{ matrix.flavor }})
-    needs: [source, build, linux-tests, quality-gates]
+    needs: [source, build]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     env:

@@ -79,7 +79,8 @@ A separate Linux source-regression job uses the same SHA and toolchain and
 runs the full app/listener/API feature graph. Its Cargo invocation includes
 `--lib --bins --test tun_config_test --test named_tun_config_test --test api_test`.
 The explicit integration targets matter: `--lib --bins` alone does not run
-them. Both flavor QA jobs require the source-regression job to succeed.
+them. Binary QA starts after the immutable builds, independently of the source
+test outcome, so failures do not suppress useful data-path diagnostics.
 Source test output, the actual command and feature graph are uploaded once.
 A separate `quality-gates` job checks out the same resolved SHA and pinned
 channel, then runs formatting, default/no-default/all-feature strict Clippy,
