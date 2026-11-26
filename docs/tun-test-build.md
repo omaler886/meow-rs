@@ -40,8 +40,8 @@ dependencies and copying the first binary before building the second:
 | `windows-2025` | `x86_64-pc-windows-msvc` | build + version check | build + version check |
 
 The pinned channel is read from `rust-toolchain.toml` (currently `1.98.1`).
-All six binaries use the same explicit command and assert that the Cargo
-feature graph includes `listener-tun`:
+All six binaries use the same explicit command and assert that the inverted Cargo
+feature graph for `meow-listener` includes `listener-tun`:
 
 ```bash
 cargo build --release --locked -p meow-app --no-default-features --features full \

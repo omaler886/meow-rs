@@ -147,7 +147,7 @@ jobs:
         run: |
           set -euo pipefail
           cargo tree --locked -p meow-app --no-default-features --features full \
-            --target "$TARGET" -e features > "$RUNNER_TEMP/tun-feature-graph.txt"
+            --target "$TARGET" -e features --invert meow-listener > "$RUNNER_TEMP/tun-feature-graph.txt"
           grep -F 'listener-tun' "$RUNNER_TEMP/tun-feature-graph.txt"
 
       # Sequential builds share native/Rust dependencies. Freeze each binary
@@ -360,7 +360,7 @@ jobs:
             echo "toolchain=$PINNED_TOOLCHAIN"
             rustc --version --verbose
             cargo --version
-            cargo tree --locked -p meow-app --no-default-features --features full -e features > "$RUNNER_TEMP/tun-source-feature-graph.txt"
+            cargo tree --locked -p meow-app --no-default-features --features full -e features --invert meow-listener > "$RUNNER_TEMP/tun-source-feature-graph.txt"
             grep -F 'listener-tun' "$RUNNER_TEMP/tun-source-feature-graph.txt"
             set -x
             cargo test --locked --no-default-features \
