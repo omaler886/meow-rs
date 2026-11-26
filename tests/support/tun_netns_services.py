@@ -386,6 +386,27 @@ def put_config(arguments):
     print(f"PASS PUT /configs provider fetch from {arguments.source}")
 
 
+def patch_config(arguments):
+    """Commit an owned live PATCH and require the running TUN to remain enabled."""
+    payload = json.loads(arguments.payload)
+    connection = http.client.HTTPConnection(arguments.address, arguments.port, timeout=5)
+    try:
+        connection.request("PATCH", "/configs", body=json.dumps(payload).encode(),
+                           headers={"Content-Type": "application/json"})
+        response = connection.getresponse()
+        body = response.read(4096)
+        if response.status != 204:
+            raise AssertionError(f"PATCH /configs failed: {response.status} {body!r}")
+        connection.request("GET", "/configs")
+        response = connection.getresponse()
+        document = json.loads(response.read())
+        if response.status != 200 or not document.get("tun", {}).get("enable"):
+            raise AssertionError("PATCH did not leave a running, enabled TUN")
+    finally:
+        connection.close()
+    print(f"PASS live PATCH {arguments.tag}: TUN remains enabled", flush=True)
+
+
 def skip_dns_name(message, offset):
     """Skip a bounded DNS label sequence or compression pointer and return its next offset."""
     while offset < len(message):
@@ -499,6 +520,11 @@ def main():
     api.add_argument("--timeout", type=float, default=5)
     api.add_argument("--receipts", required=True)
     api.add_argument("--source", required=True)
+    patch = commands.add_parser("api-patch")
+    patch.add_argument("address")
+    patch.add_argument("port", type=int)
+    patch.add_argument("tag")
+    patch.add_argument("payload")
     dns = commands.add_parser("dns")
     dns.add_argument("address")
     dns.add_argument("protocol", choices=["tcp", "udp"])
@@ -511,7 +537,8 @@ def main():
     dns.add_argument("--upstream-transport", choices=["tcp", "udp"], default="udp")
     arguments = parser.parse_args()
     operations = {"serve": lambda _: serve(), "probe": probe, "converge": converge,
-                  "fakeip": probe_fakeip, "http": probe_http, "api-put": put_config, "dns": probe_dns}
+                  "fakeip": probe_fakeip, "http": probe_http, "api-put": put_config,
+                  "api-patch": patch_config, "dns": probe_dns}
     operations[arguments.command](arguments)
 
 

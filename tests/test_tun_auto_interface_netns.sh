@@ -556,6 +556,26 @@ start_meow manual
 probe_matrix manual-wins 1
 grep -q "bound to 'uplink1'.*auto-detect-interface: false" "$WORK/manual.log" || \
     fail 'explicit interface did not disable the automatic finder'
+# Clearing a top-level override must permanently adopt the TUN-specific fallback.
+timeout 8 python3 "$SERVICES" api-patch 127.0.0.1 19090 global-cleared '{"interface-name":""}'
+probe_matrix patch-global-cleared 0
+grep -q "bound to 'uplink0'.*auto-detect-interface: false" "$WORK/manual.log" || \
+    fail 'PATCH did not adopt the TUN-specific fallback'
+# Clearing that fallback in the same PATCH restores destination-aware detection.
+timeout 8 python3 "$SERVICES" api-patch 127.0.0.1 19090 automatic-restored \
+    '{"interface-name":"","tun":{"outbound-interface":""}}'
+probe_matrix patch-automatic-restored 0
+grep -q "bound to 'uplink0'.*auto-detect-interface: true" "$WORK/manual.log" || \
+    fail 'PATCH did not restore automatic interface selection'
+retirements_before=$(grep -c 'physical default interface changed' "$WORK/manual.log" || true)
+set_default 1
+timeout --kill-after=1 5 python3 -u "$SERVICES" converge patch-auto-uplink1 \
+    --daemon-log "$WORK/manual.log" --receipts "$WORK/server.log" --before "$retirements_before" \
+    --source-v4 10.71.0.2 --source-v6 fd00:71::2 --timeout 4.8 || \
+    fail 'PATCH-restored automatic binding did not follow a new default'
+snapshot_network patch-auto-uplink1
+echo 'PASS live PATCH adopts fixed fallback, restores automatic detection and follows new default'
+set_default 0
 stop_meow
 
 write_config closed false

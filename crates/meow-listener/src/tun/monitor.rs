@@ -28,14 +28,10 @@ pub(super) async fn run(
         interval.tick().await;
         let lookup = monitor.clone();
         let observation = match tokio::task::spawn_blocking(move || lookup.refresh()).await {
-            Ok(Ok(Some(observation))) => observation,
+            Ok(Some(observation)) => observation,
             // The owning binding is gone: stop instead of polling a dead
             // generation forever.
-            Ok(Ok(None)) => return,
-            Ok(Err(error)) => {
-                warn!("tun: interface monitor lookup failed: {error}");
-                continue;
-            }
+            Ok(None) => return,
             Err(join_error) => {
                 warn!("tun: interface monitor task failed: {join_error}");
                 continue;

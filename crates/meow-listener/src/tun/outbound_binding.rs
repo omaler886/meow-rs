@@ -428,10 +428,8 @@ impl OutboundMonitor {
     /// Poll the selected interface once. `None` means the owning guard is gone
     /// and the monitor must stop; a superseded-but-live owner still records
     /// its observation so a rejected reload can flush it after restoration.
-    pub(super) fn refresh(&self) -> io::Result<Option<NetworkObservation>> {
-        let Some(guard) = self.guard.upgrade() else {
-            return Ok(None);
-        };
+    pub(super) fn refresh(&self) -> Option<NetworkObservation> {
+        let guard = self.guard.upgrade()?;
         let is_effective = guard.is_effective();
         let observed = match &self.selection {
             MonitorSelection::Default(finder) => match finder.network_identity() {
@@ -442,7 +440,7 @@ impl OutboundMonitor {
                                 "tun: interface '{}' vanished during monitor refresh: {error}",
                                 identity.name
                             );
-                            return Ok(Some(self.record(ObservedNetwork { fingerprint: None })));
+                            return Some(self.record(ObservedNetwork { fingerprint: None }));
                         }
                     }
                     ObservedNetwork {
@@ -464,7 +462,7 @@ impl OutboundMonitor {
                 }
             },
         };
-        Ok(Some(self.record(observed)))
+        Some(self.record(observed))
     }
 
     /// Generation of the pending state that still needs a successful flush.

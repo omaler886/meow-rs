@@ -318,3 +318,7 @@ personal fork when they are not needed. Do not add `pull_request_target`,
 write permissions, schedules, release actions or credentials to this test
 workflow. The candidate's actual build/test status must come from retained
 run logs, not this runbook.
+
+The practical lab also applies successful live PATCHes to remove a global
+interface override and then the TUN fallback. It checks the adopted physical
+source and a subsequent automatic default-interface handover.
